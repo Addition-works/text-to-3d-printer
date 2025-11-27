@@ -65,8 +65,8 @@ RUN if [ -f ./patching/hydra ]; then chmod +x ./patching/hydra && ./patching/hyd
 # Install moge
 RUN pip install git+https://github.com/microsoft/MoGe.git
 
-# Install gradio for our app
-RUN pip install gradio==4.36.0
+# Install gradio for our app (use 5.x which has fixed client)
+RUN pip install "gradio>=5.0.0,<6.0.0"
 
 # Set CONDA_PREFIX for SAM 3D
 ENV CONDA_PREFIX=/opt/conda/envs/sam3d-objects
@@ -87,6 +87,21 @@ RUN pip install \
     requests \
     python-dotenv \
     huggingface_hub
+
+# Reinstall numpy 2.x to match what kaolin expects
+RUN pip install --force-reinstall "numpy>=2.0"
+
+# Rebuild kaolin from source to match current numpy ABI
+RUN pip uninstall -y kaolin && \
+    TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0" IGNORE_TORCH_VER=1 \
+    pip install --no-cache-dir git+https://github.com/NVIDIAGameWorks/kaolin.git@v0.17.0
+
+# Install correct utils3d from GitHub with specific commit (MUST be last pip install - PyPI has wrong package with same name)
+RUN pip uninstall -y utils3d || true && \
+    pip install --no-cache-dir git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+
+# List utils3d contents to help debug at runtime (doesn't fail build)
+RUN python -c "import utils3d; print('utils3d installed from:', utils3d.__file__); import utils3d.numpy as np_utils; print('Available:', [x for x in dir(np_utils) if not x.startswith('_')])" || echo "utils3d debug info not available"
 
 # Copy .env to read HF_TOKEN for checkpoint download, then remove it
 COPY .env /tmp/.env

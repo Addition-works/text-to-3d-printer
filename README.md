@@ -33,12 +33,10 @@ Get tokens from:
 - Replicate: https://replicate.com/account/api-tokens
 
 **3. Build Docker image:**
-
+This will take roughly ~30 min to build and download model weights.
 ```bash
 docker build -t text-to-3d-printer .
 ```
-
-This takes 20-40 minutes (downloads ~10GB of model weights).
 
 **4. Run:**
 
