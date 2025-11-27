@@ -433,9 +433,23 @@ def convert_to_glb(input_path: str, output_path: str = None) -> str:
     
     mesh = trimesh.load(input_path)
     
+    # Flip vertically (rotate 180° around X-axis) - SAM 3D outputs are often inverted
+    # This rotation matrix flips Y and Z coordinates
+    flip_matrix = np.array([
+        [1,  0,  0, 0],
+        [0, -1,  0, 0],
+        [0,  0, -1, 0],
+        [0,  0,  0, 1]
+    ])
+    
     if isinstance(mesh, trimesh.Scene):
+        # Apply transform to each geometry in the scene
+        for name, geometry in mesh.geometry.items():
+            if hasattr(geometry, 'apply_transform'):
+                geometry.apply_transform(flip_matrix)
         mesh.export(output_path, file_type="glb")
     else:
+        mesh.apply_transform(flip_matrix)
         scene = trimesh.Scene([mesh])
         scene.export(output_path, file_type="glb")
     
@@ -622,7 +636,7 @@ def create_ui():
             gr.Markdown("### Step 4: Your 3D Model")
             model_viewer = gr.Model3D(
                 label="3D Preview (drag to rotate)",
-                clear_color=[0.9, 0.9, 0.9, 1.0],
+                clear_color=[0.15, 0.15, 0.15, 1.0],  # Dark background for better visibility
             )
             with gr.Row():
                 stl_download = gr.File(label="📥 Download STL for 3D Printing", visible=False)

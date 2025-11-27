@@ -32,6 +32,8 @@ Get tokens from:
 - HuggingFace: https://huggingface.co/settings/tokens
 - Replicate: https://replicate.com/account/api-tokens
 
+Add a billing method and credits to Replicate to use Stable Diffusion.
+
 **3. Build Docker image:**
 This will take roughly ~30 min to build and download model weights.
 ```bash
