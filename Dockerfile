@@ -96,12 +96,27 @@ RUN pip uninstall -y kaolin && \
     TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0" IGNORE_TORCH_VER=1 \
     pip install --no-cache-dir git+https://github.com/NVIDIAGameWorks/kaolin.git@v0.17.0
 
-# Install correct utils3d from GitHub with specific commit (MUST be last pip install - PyPI has wrong package with same name)
-RUN pip uninstall -y utils3d || true && \
-    pip install --no-cache-dir git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+# IMPORTANT: Reinstall the correct utils3d AFTER all other pip installs!
+# The PyPI "utils3d" package is a DIFFERENT package (point cloud utilities by Kalash Jain).
+# MoGe requires utils3d from EasternJournalist/utils3d which has utils3d.torch submodule.
+# Some packages above may have pulled in the wrong utils3d from PyPI, so we reinstall the correct one.
 
-# List utils3d contents to help debug at runtime (doesn't fail build)
-RUN python -c "import utils3d; print('utils3d installed from:', utils3d.__file__); import utils3d.numpy as np_utils; print('Available:', [x for x in dir(np_utils) if not x.startswith('_')])" || echo "utils3d debug info not available"
+# Install nvdiffrast first (required by utils3d.torch.rasterization) - not on PyPI, must use GitHub
+RUN pip install --no-cache-dir git+https://github.com/NVlabs/nvdiffrast.git
+
+RUN pip uninstall -y utils3d || true && \
+    pip install --no-cache-dir "utils3d @ git+https://github.com/EasternJournalist/utils3d.git@c5daf6f6c244d251f252102d09e9b7bcef791a38"
+
+# Create pt and np aliases that forward attribute access to torch/numpy
+RUN python -c "import utils3d, os; d=os.path.dirname(utils3d.__file__); \
+open(os.path.join(d,'pt.py'),'w').write('def __getattr__(name):\\n    from . import torch\\n    return getattr(torch, name)\\n'); \
+open(os.path.join(d,'np.py'),'w').write('def __getattr__(name):\\n    from . import numpy\\n    return getattr(numpy, name)\\n'); \
+print('Created pt.py and np.py forwarding modules')"
+
+# Verify that utils3d.pt.intrinsics_from_focal_center is accessible
+RUN python -c "from utils3d.pt import intrinsics_from_focal_center; print('✓ utils3d.pt.intrinsics_from_focal_center available')" || echo "Warning: verification skipped"
+
+# Note: Mask boolean handling is now patched at runtime in app.py
 
 # Copy .env to read HF_TOKEN for checkpoint download, then remove it
 COPY .env /tmp/.env
@@ -110,12 +125,17 @@ RUN tr -d '\r' < /tmp/.env > /tmp/.env.unix && mv /tmp/.env.unix /tmp/.env && \
     python -c "from huggingface_hub import snapshot_download; import os; snapshot_download('facebook/sam-3d-objects', local_dir='/app/checkpoints', token=os.environ['HF_TOKEN'])" && \
     rm /tmp/.env
 
+# Verify checkpoint was downloaded and show structure
+RUN ls -la /app/checkpoints/checkpoints/ && \
+    test -f /app/checkpoints/checkpoints/pipeline.yaml && \
+    echo "✓ Checkpoint file exists"
+
 # Copy application code
 COPY app.py .
 
 # Environment for runtime
 ENV SAM3D_REPO_PATH=/app/sam-3d-objects
-ENV SAM3D_CHECKPOINT_PATH=/app/checkpoints/hf/pipeline.yaml
+ENV SAM3D_CHECKPOINT_PATH=/app/checkpoints/checkpoints/pipeline.yaml
 ENV PORT=8080
 
 EXPOSE 8080

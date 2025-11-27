@@ -34,7 +34,7 @@ load_dotenv()
 
 REPLICATE_MODEL = "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b"
 IMAGE_SIZE = 1024
-NUM_VARIANTS = 4
+NUM_VARIANTS = 2  # Reduced from 4 to save costs
 
 # SAM 3D Objects paths (set via environment variables in Docker)
 SAM3D_REPO_PATH = os.environ.get("SAM3D_REPO_PATH", "/app/sam-3d-objects")
@@ -56,6 +56,46 @@ if os.path.exists(sam3d_notebook_path):
     try:
         from inference import Inference as SAM3DInference
         print("✓ SAM 3D Objects loaded successfully")
+        
+        # ---------------------------------------------------------------------------
+        # MONKEY-PATCH: Fix mask boolean indexing issue in SAM 3D Objects
+        # The _compute_scale_and_shift function uses pointmap[mask] which fails
+        # when mask is uint8 (0/255) instead of boolean.
+        # ---------------------------------------------------------------------------
+        try:
+            import torch
+            from sam3d_objects.data.dataset.tdfy import img_and_mask_transforms
+            
+            # Find and patch all normalizer classes
+            for name in dir(img_and_mask_transforms):
+                cls = getattr(img_and_mask_transforms, name)
+                if isinstance(cls, type) and hasattr(cls, '_compute_scale_and_shift'):
+                    original_method = cls._compute_scale_and_shift
+                    
+                    def make_patched_method(orig):
+                        def patched_compute_scale_and_shift(self, pointmap, mask):
+                            # Convert mask to boolean if it's not already
+                            if mask.dtype != torch.bool:
+                                print(f"[MASK PATCH] Converting mask from {mask.dtype} to bool")
+                                mask = mask > 0
+                            
+                            mask_sum = mask.sum().item()
+                            print(f"[MASK PATCH] pointmap: {pointmap.shape}, mask: {mask.shape}, True pixels: {int(mask_sum)}")
+                            
+                            # Handle empty mask case
+                            if mask_sum == 0:
+                                print("[MASK PATCH] WARNING: Mask has zero foreground pixels! Returning defaults.")
+                                return pointmap, torch.tensor(1.0, device=pointmap.device), torch.tensor(0.0, device=pointmap.device)
+                            
+                            return orig(self, pointmap, mask)
+                        return patched_compute_scale_and_shift
+                    
+                    cls._compute_scale_and_shift = make_patched_method(original_method)
+                    print(f"✓ Patched {name}._compute_scale_and_shift for boolean mask handling")
+                    
+        except Exception as patch_error:
+            print(f"⚠ Could not apply mask patch: {patch_error}")
+            
     except ImportError as e:
         print(f"✗ Failed to import SAM 3D Objects: {e}")
         SAM3D_AVAILABLE = False
@@ -74,7 +114,8 @@ def get_sam3d_inference():
     global _sam3d_inference
     if _sam3d_inference is None and SAM3D_AVAILABLE:
         print("Loading SAM 3D Objects model (this may take a moment)...")
-        _sam3d_inference = SAM3DInference(config_path=SAM3D_CHECKPOINT_PATH, compile=False)
+        # First arg is positional (config path), compile is keyword
+        _sam3d_inference = SAM3DInference(SAM3D_CHECKPOINT_PATH, compile=False)
         print("✓ SAM 3D Objects model loaded")
     return _sam3d_inference
 
@@ -175,6 +216,14 @@ def reconstruct_3d(image: Image.Image, mask: np.ndarray, seed: int = 42) -> dict
     """
     Use SAM 3D Objects to reconstruct a 3D model from image + mask.
     Returns dict with paths to output files.
+    
+    SAM 3D Objects inference API format (based on load_image/load_single_mask):
+    - image: numpy array with shape (H, W, 3) - RGB image
+    - mask: numpy array with shape (H, W) - 2D binary mask (0-255 uint8)
+    
+    The inference code internally calls merge_mask_to_rgba which combines them:
+        rgba_image = np.concatenate([image[..., :3], mask], axis=-1)
+    Note: The inference code handles adding the channel dimension to the mask.
     """
     if not SAM3D_AVAILABLE:
         raise RuntimeError(
@@ -186,40 +235,153 @@ def reconstruct_3d(image: Image.Image, mask: np.ndarray, seed: int = 42) -> dict
     if inference is None:
         raise RuntimeError("Failed to load SAM 3D Objects model")
     
-    # Ensure image is RGB
+    # Convert PIL Image to numpy array (H, W, 3)
     if image.mode != "RGB":
         image = image.convert("RGB")
+    image_np = np.array(image)
     
-    # Ensure mask is the right shape and type
-    if mask.dtype != np.uint8:
-        mask = mask.astype(np.uint8)
+    # Ensure mask is 2D (H, W) - NOT 3D!
+    # load_single_mask returns: np.array(Image.open(mask_path).convert('L')) which is 2D
     if len(mask.shape) == 3:
         mask = mask[:, :, 0]
+    elif len(mask.shape) == 4:
+        mask = mask[0, :, :, 0]
     
-    # Normalize mask to 0-1 range for SAM 3D
-    mask_normalized = (mask > 128).astype(np.float32)
+    # Ensure mask is uint8 with 0-255 values
+    if mask.dtype != np.uint8:
+        if mask.max() <= 1:
+            mask = (mask * 255).astype(np.uint8)
+        else:
+            mask = mask.astype(np.uint8)
+    
+    # Keep mask as 2D (H, W) - the inference code will handle adding dimension
+    mask_2d = mask
+    
+    # Debug: Print detailed mask statistics
+    foreground_pixels = np.sum(mask_2d > 128)
+    total_pixels = mask_2d.size
+    foreground_pct = foreground_pixels / total_pixels * 100
+    
+    print(f"Image shape: {image_np.shape}, dtype: {image_np.dtype}")
+    print(f"Mask shape: {mask_2d.shape}, dtype: {mask_2d.dtype}")
+    print(f"Mask value range: [{mask_2d.min()}, {mask_2d.max()}]")
+    print(f"Mask unique values: {np.unique(mask_2d)[:10]}...")  # First 10 unique values
+    print(f"Mask foreground pixels (>128): {foreground_pixels} / {total_pixels} ({foreground_pct:.1f}%)")
+    
+    # Save debug images
+    debug_dir = "/tmp/sam3d_debug"
+    os.makedirs(debug_dir, exist_ok=True)
+    Image.fromarray(image_np).save(f"{debug_dir}/input_image.png")
+    Image.fromarray(mask_2d).save(f"{debug_dir}/input_mask.png")
+    print(f"Debug images saved to {debug_dir}")
+    
+    # Check if mask has enough foreground
+    if foreground_pct < 1.0:
+        print("WARNING: Mask has very few foreground pixels (<1%) - object may not have been detected")
+        # Check if we should invert
+        background_pixels = total_pixels - foreground_pixels
+        if background_pixels < foreground_pixels:
+            print("Mask seems inverted (more foreground than background), not inverting")
+        else:
+            print("Trying inverted mask...")
+            mask_2d_inv = 255 - mask_2d
+            fg_inv = np.sum(mask_2d_inv > 128)
+            fg_inv_pct = fg_inv / total_pixels * 100
+            print(f"  Inverted mask foreground: {fg_inv} ({fg_inv_pct:.1f}%)")
+            if fg_inv_pct > foreground_pct and fg_inv_pct < 90:
+                print("  Using inverted mask")
+                mask_2d = mask_2d_inv
+                foreground_pixels = fg_inv
+                foreground_pct = fg_inv_pct
+                Image.fromarray(mask_2d).save(f"{debug_dir}/input_mask_inverted.png")
+    
+    # IMPORTANT: SAM 3D internally uses the mask for:
+    # 1. Creating RGBA image (mask as alpha channel, needs 0-255 range)
+    # 2. Boolean indexing for pointmap normalization
+    #
+    # The mask from load_single_mask is strictly binary (0 or 255).
+    # rembg might produce anti-aliased edges with intermediate values.
+    # We ensure strictly binary values for consistency.
+    
+    # Convert mask to strict binary 0/255 (threshold at 128)
+    mask_binary = np.where(mask_2d > 128, 255, 0).astype(np.uint8)
+    print(f"Converted mask to binary 0/255: unique values = {np.unique(mask_binary)}")
+    print(f"Binary mask foreground pixels: {np.sum(mask_binary == 255)}")
+    
+    # Save debug image
+    Image.fromarray(mask_binary).save(f"{debug_dir}/input_mask_binary.png")
     
     print("Running SAM 3D Objects reconstruction...")
-    output = inference(image, mask_normalized, seed=seed)
+    
+    # Pass numpy array image (H,W,3) and 2D binary mask (H,W) with values 0/255
+    output = inference(image_np, mask_binary, seed=seed)
     print("✓ Reconstruction complete")
+    
+    # Debug: show what's in the output
+    print(f"  Output keys: {list(output.keys())}")
+    for key, value in output.items():
+        if isinstance(value, list):
+            print(f"    {key}: list of {len(value)} items")
+        else:
+            print(f"    {key}: {type(value).__name__}")
     
     # Save outputs to temp files
     output_dir = tempfile.mkdtemp(prefix="sam3d_")
     output_paths = {}
     
-    # Save Gaussian Splat PLY
+    # Save Gaussian Splat PLY (may be a single object or a list)
     if "gs" in output:
         ply_path = os.path.join(output_dir, "model.ply")
-        output["gs"].save_ply(ply_path)
-        output_paths["ply"] = ply_path
-        print(f"  Saved PLY: {ply_path}")
+        gs_data = output["gs"]
+        
+        if isinstance(gs_data, list):
+            print(f"  Got {len(gs_data)} Gaussian splat(s)")
+            if len(gs_data) > 0:
+                gs_data[0].save_ply(ply_path)
+                output_paths["ply"] = ply_path
+                print(f"  Saved PLY: {ply_path}")
+        else:
+            gs_data.save_ply(ply_path)
+            output_paths["ply"] = ply_path
+            print(f"  Saved PLY: {ply_path}")
     
-    # Save mesh if available
-    if "mesh" in output:
+    # Save mesh - prefer 'glb' (Trimesh) over 'mesh' (MeshExtractResult)
+    # The 'glb' output is a proper Trimesh object we can export directly
+    if "glb" in output:
         obj_path = os.path.join(output_dir, "model.obj")
-        output["mesh"].export(obj_path)
-        output_paths["obj"] = obj_path
-        print(f"  Saved OBJ: {obj_path}")
+        glb_data = output["glb"]
+        
+        if isinstance(glb_data, list):
+            print(f"  Got {len(glb_data)} GLB mesh(es)")
+            if len(glb_data) > 0:
+                glb_data[0].export(obj_path)
+                output_paths["obj"] = obj_path
+                print(f"  Saved OBJ from GLB: {obj_path}")
+        else:
+            glb_data.export(obj_path)
+            output_paths["obj"] = obj_path
+            print(f"  Saved OBJ from GLB: {obj_path}")
+    
+    elif "mesh" in output:
+        # Fallback: try to extract trimesh from MeshExtractResult
+        obj_path = os.path.join(output_dir, "model.obj")
+        mesh_data = output["mesh"]
+        
+        if isinstance(mesh_data, list):
+            mesh_data = mesh_data[0] if len(mesh_data) > 0 else None
+        
+        if mesh_data is not None:
+            # MeshExtractResult may have a .mesh attribute or similar
+            if hasattr(mesh_data, 'mesh'):
+                mesh_data.mesh.export(obj_path)
+                output_paths["obj"] = obj_path
+                print(f"  Saved OBJ from mesh.mesh: {obj_path}")
+            elif hasattr(mesh_data, 'export'):
+                mesh_data.export(obj_path)
+                output_paths["obj"] = obj_path
+                print(f"  Saved OBJ: {obj_path}")
+            else:
+                print(f"  Warning: Could not export mesh (type: {type(mesh_data).__name__})")
     
     return output_paths
 
@@ -437,7 +599,7 @@ def create_ui():
             gr.Markdown("*Click on the image you like best*")
             gallery = gr.Gallery(
                 label="Generated Images",
-                columns=4,
+                columns=2,
                 rows=1,
                 height="auto",
                 object_fit="contain",
