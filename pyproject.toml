@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "text-to-3d-printer"
+version = "0.1.0"
+description = ""
+authors = ["Joe Nance <joe@nceno.app>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+light-the-torch = "^0.7.0"
+gradio = "4.36.0"
+replicate = "^0.34.0"
+Pillow = "^10.4.0"
+numpy = "^1.26.0"
+trimesh = { extras = ["easy"], version = "^4.4.0" }
+rembg = "^2.0.59"
+onnxruntime = "^1.19.0"
+requests = "^2.32.0"
+python-dotenv = "^1.0.1"
+huggingface_hub = "^0.26.0"
+transformers = "^4.46.0"
+accelerate = "^1.0.0"
+safetensors = "^0.4.0"
+einops = "^0.8.0"
+omegaconf = "^2.3.0"
+hydra-core = "^1.3.0"
+pytorch-lightning = "^2.4.0"
+kornia = "^0.7.0"
+plyfile = "^1.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ignore the sam-3d-objects folder
+sam-3d-objects/
+
+# ignore the checkpoints folder
+checkpoints/
