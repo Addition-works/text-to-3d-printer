@@ -763,11 +763,27 @@ def step4_reconstruct():
             mode=state.mode
         )
         
-        # Convert to formats we need
-        if "ply" in state.output_paths:
-            # Convert PLY to GLB for viewing
+        # Convert to formats we need based on mode
+        if state.mode == "objects" and "ply" in state.output_paths:
+            # For Objects mode: show Gaussian Splat PLY directly in viewer
+            # Gradio Model3D natively supports .ply/.splat files and renders them
+            # with full color, unlike the washed-out mesh conversion
+            viewer_path = state.output_paths["ply"]
+            
+            # Convert OBJ mesh to STL for 3D printing (if available)
+            if "obj" in state.output_paths:
+                stl_path = convert_to_stl(state.output_paths["obj"])
+                state.output_paths["stl"] = stl_path
+            else:
+                # Fallback: try converting PLY (may not work well for Gaussian Splats)
+                stl_path = convert_to_stl(state.output_paths["ply"])
+                state.output_paths["stl"] = stl_path
+        
+        elif "ply" in state.output_paths:
+            # For Body mode: convert PLY to GLB for viewing
             glb_path = convert_to_glb(state.output_paths["ply"])
             state.output_paths["glb"] = glb_path
+            viewer_path = glb_path
             
             # Convert to STL for 3D printing
             stl_path = convert_to_stl(state.output_paths["ply"])
@@ -776,16 +792,18 @@ def step4_reconstruct():
         elif "obj" in state.output_paths:
             glb_path = convert_to_glb(state.output_paths["obj"])
             state.output_paths["glb"] = glb_path
+            viewer_path = glb_path
             
             stl_path = convert_to_stl(state.output_paths["obj"])
             state.output_paths["stl"] = stl_path
         
-        # Return GLB for 3D viewer
-        glb_path = state.output_paths.get("glb")
+        else:
+            raise gr.Error("No 3D model output found")
+        
         stl_path = state.output_paths.get("stl")
         
         return (
-            glb_path,
+            viewer_path,
             gr.update(value=stl_path, visible=True),
             gr.update(visible=True)
         )
