@@ -7,7 +7,7 @@ Pipeline:
 2. User selects best image
 3. Auto-segment object from background (rembg)
 4. User confirms mask
-5. SAM 3D Objects OR SAM 3D Body reconstructs 3D model
+5. SAM 3D Objects reconstructs 3D model
 6. Convert to STL for 3D printing
 7. Preview and download
 """
@@ -39,10 +39,6 @@ NUM_VARIANTS = 2  # Reduced from 4 to save costs
 # SAM 3D Objects paths (set via environment variables in Docker)
 SAM3D_REPO_PATH = os.environ.get("SAM3D_REPO_PATH", "/app/sam-3d-objects")
 SAM3D_CHECKPOINT_PATH = os.environ.get("SAM3D_CHECKPOINT_PATH", "/app/checkpoints/checkpoints/pipeline.yaml")
-
-# SAM 3D Body paths (set via environment variables in Docker)
-SAM3D_BODY_REPO_PATH = os.environ.get("SAM3D_BODY_REPO_PATH", "/app/sam-3d-body")
-SAM3D_BODY_HF_REPO = os.environ.get("SAM3D_BODY_HF_REPO", "facebook/sam-3d-body-dinov3")
 
 # ---------------------------------------------------------------------------
 # SAM 3D Objects Setup
@@ -109,35 +105,8 @@ else:
     SAM3D_OBJECTS_AVAILABLE = False
     SAM3DInference = None
 
-# ---------------------------------------------------------------------------
-# SAM 3D Body Setup
-# ---------------------------------------------------------------------------
-
-# Add SAM 3D Body to path
-sam3d_body_path = SAM3D_BODY_REPO_PATH
-if os.path.exists(sam3d_body_path):
-    sys.path.insert(0, sam3d_body_path)
-    # Also add notebook folder for utils
-    sam3d_body_notebook_path = os.path.join(sam3d_body_path, "notebook")
-    if os.path.exists(sam3d_body_notebook_path):
-        sys.path.insert(0, sam3d_body_notebook_path)
-    
-    SAM3D_BODY_AVAILABLE = True
-    try:
-        from notebook.utils import setup_sam_3d_body
-        print("✓ SAM 3D Body loaded successfully")
-    except ImportError as e:
-        print(f"✗ Failed to import SAM 3D Body: {e}")
-        SAM3D_BODY_AVAILABLE = False
-        setup_sam_3d_body = None
-else:
-    print(f"✗ SAM 3D Body not found at {sam3d_body_path}")
-    SAM3D_BODY_AVAILABLE = False
-    setup_sam_3d_body = None
-
-# Global inference objects (loaded once)
+# Global inference object (loaded once)
 _sam3d_objects_inference = None
-_sam3d_body_estimator = None
 
 
 def get_sam3d_objects_inference():
@@ -151,54 +120,30 @@ def get_sam3d_objects_inference():
     return _sam3d_objects_inference
 
 
-def get_sam3d_body_estimator():
-    """Lazy-load SAM 3D Body estimator model."""
-    global _sam3d_body_estimator
-    if _sam3d_body_estimator is None and SAM3D_BODY_AVAILABLE:
-        print("Loading SAM 3D Body model (this may take a moment)...")
-        _sam3d_body_estimator = setup_sam_3d_body(hf_repo_id=SAM3D_BODY_HF_REPO)
-        print("✓ SAM 3D Body model loaded")
-    return _sam3d_body_estimator
-
-
 # ---------------------------------------------------------------------------
 # Step 1: Image Generation (Replicate / Stable Diffusion)
 # ---------------------------------------------------------------------------
 
-def generate_images(prompt: str, mode: str = "objects", num_images: int = NUM_VARIANTS) -> list[Image.Image]:
+def generate_images(prompt: str, num_images: int = NUM_VARIANTS) -> list[Image.Image]:
     """
     Generate images from a text prompt using Stable Diffusion.
     Returns a list of PIL Images.
     
     Args:
         prompt: The user's text prompt
-        mode: "objects" for product-style or "body" for human poses
         num_images: Number of variants to generate
     """
-    if mode == "body":
-        # Enhance prompt for clear, full-body human images
-        enhanced_prompt = (
-            f"{prompt}, full body visible, standing pose, "
-            f"plain background, studio lighting, high detail, sharp focus, "
-            f"single person, no cropping, professional photo"
-        )
-        negative_prompt = (
-            "blurry, multiple people, cluttered, busy background, "
-            "text, watermark, logo, cropped body, partial body, "
-            "low quality, distorted, deformed, face closeup"
-        )
-    else:
-        # Enhance prompt for clean, product-style images that work well for 3D reconstruction
-        enhanced_prompt = (
-            f"{prompt}, product photography, centered in frame, "
-            f"plain white background, studio lighting, high detail, sharp focus, "
-            f"single object, no shadows, professional product shot"
-        )
-        negative_prompt = (
-            "blurry, multiple objects, cluttered, busy background, "
-            "text, watermark, logo, human hands, person, shadow, "
-            "low quality, distorted, deformed"
-        )
+    # Enhance prompt for clean, product-style images that work well for 3D reconstruction
+    enhanced_prompt = (
+        f"{prompt}, product photography, centered in frame, "
+        f"plain white background, studio lighting, high detail, sharp focus, "
+        f"single object, no shadows, professional product shot"
+    )
+    negative_prompt = (
+        "blurry, multiple objects, cluttered, busy background, "
+        "text, watermark, logo, human hands, person, shadow, "
+        "low quality, distorted, deformed"
+    )
     
     images = []
     for i in range(num_images):
@@ -267,10 +212,10 @@ def create_mask_preview(image: Image.Image, mask: np.ndarray) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# Step 3a: 3D Reconstruction (SAM 3D Objects)
+# Step 3: 3D Reconstruction (SAM 3D Objects)
 # ---------------------------------------------------------------------------
 
-def reconstruct_3d_objects(image: Image.Image, mask: np.ndarray, seed: int = 42) -> dict:
+def reconstruct_3d(image: Image.Image, mask: np.ndarray, seed: int = 42) -> dict:
     """
     Use SAM 3D Objects to reconstruct a 3D model from image + mask.
     Returns dict with paths to output files.
@@ -445,146 +390,6 @@ def reconstruct_3d_objects(image: Image.Image, mask: np.ndarray, seed: int = 42)
 
 
 # ---------------------------------------------------------------------------
-# Step 3b: 3D Reconstruction (SAM 3D Body)
-# ---------------------------------------------------------------------------
-
-def reconstruct_3d_body(image: Image.Image, mask: np.ndarray = None, seed: int = 42) -> dict:
-    """
-    Use SAM 3D Body to reconstruct a 3D human body mesh from image.
-    Returns dict with paths to output files.
-    
-    SAM 3D Body API:
-    - Uses setup_sam_3d_body() to create estimator
-    - estimator.process_one_image() takes RGB numpy array
-    - Returns outputs with pred_vertices and estimator.faces for mesh
-    
-    Note: SAM 3D Body does NOT require a mask - it detects humans automatically.
-    The mask parameter is ignored but kept for API consistency.
-    """
-    import cv2
-    
-    if not SAM3D_BODY_AVAILABLE:
-        raise RuntimeError(
-            "SAM 3D Body is not available. "
-            "Make sure you're running in the Docker container with GPU support."
-        )
-    
-    estimator = get_sam3d_body_estimator()
-    if estimator is None:
-        raise RuntimeError("Failed to load SAM 3D Body model")
-    
-    # Convert PIL Image to numpy array (RGB)
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    image_np = np.array(image)
-    
-    print(f"Image shape: {image_np.shape}, dtype: {image_np.dtype}")
-    
-    # Save debug image
-    debug_dir = "/tmp/sam3d_debug"
-    os.makedirs(debug_dir, exist_ok=True)
-    Image.fromarray(image_np).save(f"{debug_dir}/body_input_image.png")
-    print(f"Debug image saved to {debug_dir}")
-    
-    print("Running SAM 3D Body reconstruction...")
-    
-    # SAM 3D Body expects RGB input
-    outputs = estimator.process_one_image(image_np)
-    print("✓ SAM 3D Body reconstruction complete")
-    
-    # Debug: show what's in the output
-    if isinstance(outputs, dict):
-        print(f"  Output keys: {list(outputs.keys())}")
-    elif isinstance(outputs, list):
-        print(f"  Got {len(outputs)} detected person(s)")
-        if len(outputs) > 0 and isinstance(outputs[0], dict):
-            print(f"  First person keys: {list(outputs[0].keys())}")
-    
-    # Save outputs to temp files
-    output_dir = tempfile.mkdtemp(prefix="sam3d_body_")
-    output_paths = {}
-    
-    # Get the mesh data - outputs can be a list of dicts (one per detected person)
-    # or a single dict with pred_vertices
-    if isinstance(outputs, list) and len(outputs) > 0:
-        # Multiple people detected, use first one
-        person_output = outputs[0]
-    else:
-        person_output = outputs
-    
-    # Extract vertices and faces
-    # pred_vertices contains 3D mesh vertices in camera coordinates
-    if 'pred_vertices' in person_output:
-        import torch
-        
-        vertices = person_output['pred_vertices']
-        faces = estimator.faces  # The face indices are stored on the estimator
-        
-        # Convert to numpy if tensor
-        if isinstance(vertices, torch.Tensor):
-            vertices = vertices.cpu().numpy()
-        if isinstance(faces, torch.Tensor):
-            faces = faces.cpu().numpy()
-        
-        # Handle batch dimension if present
-        if len(vertices.shape) == 3:
-            vertices = vertices[0]  # Take first batch item
-        if len(faces.shape) == 3:
-            faces = faces[0]
-        
-        print(f"  Vertices shape: {vertices.shape}")
-        print(f"  Faces shape: {faces.shape}")
-        
-        # Create trimesh object
-        mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-        
-        # Save as PLY
-        ply_path = os.path.join(output_dir, "body_model.ply")
-        mesh.export(ply_path)
-        output_paths["ply"] = ply_path
-        print(f"  Saved PLY: {ply_path}")
-        
-        # Save as OBJ
-        obj_path = os.path.join(output_dir, "body_model.obj")
-        mesh.export(obj_path)
-        output_paths["obj"] = obj_path
-        print(f"  Saved OBJ: {obj_path}")
-    else:
-        print("  Warning: No pred_vertices in output, trying alternative extraction...")
-        # Try to find mesh data in other formats
-        for key in ['vertices', 'mesh', 'body_mesh']:
-            if key in person_output:
-                print(f"  Found alternative key: {key}")
-                break
-        else:
-            raise RuntimeError("Could not find mesh vertices in SAM 3D Body output")
-    
-    return output_paths
-
-
-# ---------------------------------------------------------------------------
-# Unified reconstruction function
-# ---------------------------------------------------------------------------
-
-def reconstruct_3d(image: Image.Image, mask: np.ndarray, mode: str = "objects", seed: int = 42) -> dict:
-    """
-    Unified 3D reconstruction that dispatches to Objects or Body model.
-    
-    Args:
-        image: Input PIL Image
-        mask: Binary mask (used by Objects, ignored by Body)
-        mode: "objects" or "body"
-        seed: Random seed
-    
-    Returns dict with paths to output files.
-    """
-    if mode == "body":
-        return reconstruct_3d_body(image=image, mask=mask, seed=seed)
-    else:
-        return reconstruct_3d_objects(image=image, mask=mask, seed=seed)
-
-
-# ---------------------------------------------------------------------------
 # Step 4: Mesh Conversion (PLY/OBJ → STL)
 # ---------------------------------------------------------------------------
 
@@ -665,7 +470,6 @@ class PipelineState:
     
     def reset(self):
         self.prompt = ""
-        self.mode = "objects"  # "objects" or "body"
         self.generated_images = []
         self.selected_image = None
         self.selected_index = None
@@ -677,29 +481,22 @@ class PipelineState:
 state = PipelineState()
 
 
-def step1_generate(prompt: str, mode: str):
+def step1_generate(prompt: str):
     """Generate images from prompt."""
     if not prompt.strip():
         raise gr.Error("Please enter a description of what you want to create.")
     
-    # Validate mode selection against available models
-    if mode == "body" and not SAM3D_BODY_AVAILABLE:
-        raise gr.Error(
-            "SAM 3D Body is not available in this installation. "
-            "Please select 'Objects' mode or run with full Docker setup."
-        )
-    if mode == "objects" and not SAM3D_OBJECTS_AVAILABLE:
+    if not SAM3D_OBJECTS_AVAILABLE:
         raise gr.Error(
             "SAM 3D Objects is not available in this installation. "
-            "Please select 'Human Body' mode or run with full Docker setup."
+            "Please run with full Docker setup."
         )
     
     state.reset()
     state.prompt = prompt
-    state.mode = mode
     
     gr.Info("Generating images... This may take 30-60 seconds.")
-    state.generated_images = generate_images(prompt=prompt, mode=mode, num_images=NUM_VARIANTS)
+    state.generated_images = generate_images(prompt=prompt, num_images=NUM_VARIANTS)
     
     return state.generated_images
 
@@ -737,37 +534,27 @@ def step4_reconstruct():
     if state.selected_image is None:
         raise gr.Error("Please select an image first.")
     
-    # Body mode doesn't strictly require mask, but Objects mode does
-    if state.mode == "objects" and state.mask is None:
+    if state.mask is None:
         raise gr.Error("Please select an image and confirm the mask first.")
     
-    # Check model availability
-    if state.mode == "body" and not SAM3D_BODY_AVAILABLE:
-        raise gr.Error(
-            "SAM 3D Body is not available. "
-            "Please run this app in the Docker container with GPU support."
-        )
-    if state.mode == "objects" and not SAM3D_OBJECTS_AVAILABLE:
+    if not SAM3D_OBJECTS_AVAILABLE:
         raise gr.Error(
             "SAM 3D Objects is not available. "
             "Please run this app in the Docker container with GPU support."
         )
     
-    mode_name = "Human Body" if state.mode == "body" else "Object"
-    gr.Info(f"Reconstructing 3D {mode_name}... This may take 30-60 seconds.")
+    gr.Info("Reconstructing 3D Object... This may take 30-60 seconds.")
     
     try:
         state.output_paths = reconstruct_3d(
             image=state.selected_image, 
-            mask=state.mask, 
-            mode=state.mode
+            mask=state.mask
         )
         
-        # Convert to formats we need based on mode
-        if state.mode == "objects" and "ply" in state.output_paths:
-            # For Objects mode: show Gaussian Splat PLY directly in viewer
-            # Gradio Model3D natively supports .ply/.splat files and renders them
-            # with full color, unlike the washed-out mesh conversion
+        # For Objects mode: show Gaussian Splat PLY directly in viewer
+        # Gradio Model3D natively supports .ply/.splat files and renders them
+        # with full color, unlike the washed-out mesh conversion
+        if "ply" in state.output_paths:
             viewer_path = state.output_paths["ply"]
             
             # Convert OBJ mesh to STL for 3D printing (if available)
@@ -778,16 +565,6 @@ def step4_reconstruct():
                 # Fallback: try converting PLY (may not work well for Gaussian Splats)
                 stl_path = convert_to_stl(state.output_paths["ply"])
                 state.output_paths["stl"] = stl_path
-        
-        elif "ply" in state.output_paths:
-            # For Body mode: convert PLY to GLB for viewing
-            glb_path = convert_to_glb(state.output_paths["ply"])
-            state.output_paths["glb"] = glb_path
-            viewer_path = glb_path
-            
-            # Convert to STL for 3D printing
-            stl_path = convert_to_stl(state.output_paths["ply"])
-            state.output_paths["stl"] = stl_path
         
         elif "obj" in state.output_paths:
             glb_path = convert_to_glb(state.output_paths["obj"])
@@ -833,29 +610,19 @@ def create_ui():
             # 🖨️ Text to 3D Printer
             
             Transform your ideas into 3D printable models in 4 simple steps:
-            1. **Choose mode** - Objects (products, items) or Human Body (poses)
-            2. **Describe** what you want to create
-            3. **Select** the best generated image
+            1. **Describe** what you want to create
+            2. **Select** the best generated image
+            3. **Confirm** the object mask
             4. **Download** your 3D printable STL file
             """
         )
         
-        # Step 1: Mode Selection & Text Input
+        # Step 1: Text Input
         with gr.Group():
-            gr.Markdown("### Step 1: Choose Mode & Describe")
-            with gr.Row():
-                mode_selector = gr.Radio(
-                    choices=[
-                        ("🎁 Objects (products, items, things)", "objects"),
-                        ("🧍 Human Body (poses, figures)", "body")
-                    ],
-                    value="objects",
-                    label="What do you want to 3D print?",
-                    interactive=True,
-                )
+            gr.Markdown("### Step 1: Describe Your Object")
             with gr.Row():
                 prompt_input = gr.Textbox(
-                    label="Describe your object or person",
+                    label="Describe your object",
                     placeholder="e.g., a ceramic coffee mug with geometric patterns",
                     lines=2,
                     scale=4,
@@ -863,16 +630,8 @@ def create_ui():
                 generate_btn = gr.Button("🎨 Generate Images", variant="primary", scale=1)
             
             # Show availability status
-            status_parts = []
-            if SAM3D_OBJECTS_AVAILABLE:
-                status_parts.append("✓ Objects mode available")
-            else:
-                status_parts.append("✗ Objects mode not available")
-            if SAM3D_BODY_AVAILABLE:
-                status_parts.append("✓ Body mode available")
-            else:
-                status_parts.append("✗ Body mode not available")
-            gr.Markdown(f"*Model status: {' | '.join(status_parts)}*")
+            status = "✓ SAM 3D Objects available" if SAM3D_OBJECTS_AVAILABLE else "✗ SAM 3D Objects not available"
+            gr.Markdown(f"*Model status: {status}*")
         
         # Step 2: Image Selection
         with gr.Group():
@@ -919,7 +678,7 @@ def create_ui():
         # Wire up events
         generate_btn.click(
             fn=step1_generate,
-            inputs=[prompt_input, mode_selector],
+            inputs=[prompt_input],
             outputs=[gallery],
         )
         
@@ -967,7 +726,6 @@ if __name__ == "__main__":
     # Print model availability
     print("\n--- Model Availability ---")
     print(f"SAM 3D Objects: {'✓ Available' if SAM3D_OBJECTS_AVAILABLE else '✗ Not available'}")
-    print(f"SAM 3D Body: {'✓ Available' if SAM3D_BODY_AVAILABLE else '✗ Not available'}")
     print("--------------------------\n")
     
     # Create and launch the app

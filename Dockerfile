@@ -18,11 +18,6 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     libgomp1 \
     ninja-build \
-    # Additional dependencies for SAM 3D Body (pyrender requires osmesa)
-    libosmesa6-dev \
-    libglu1-mesa-dev \
-    freeglut3-dev \
-    mesa-common-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Miniforge (conda-forge based, no ToS issues)
@@ -43,9 +38,6 @@ WORKDIR /app
 
 # Clone SAM 3D Objects first to get their environment file
 RUN git clone https://github.com/facebookresearch/sam-3d-objects.git /app/sam-3d-objects
-
-# Clone SAM 3D Body
-RUN git clone https://github.com/facebookresearch/sam-3d-body.git /app/sam-3d-body
 
 # Create conda environment from SAM 3D Objects' exact specification (using mamba for speed)
 WORKDIR /app/sam-3d-objects
@@ -72,43 +64,6 @@ RUN if [ -f ./patching/hydra ]; then chmod +x ./patching/hydra && ./patching/hyd
 
 # Install moge
 RUN pip install git+https://github.com/microsoft/MoGe.git
-
-# ---------------------------------------------------------------------------
-# SAM 3D Body Dependencies
-# These are installed INTO the sam3d-objects env to avoid conflicts
-# Based on SAM 3D Body INSTALL.md requirements
-# ---------------------------------------------------------------------------
-
-# SAM 3D Body dependencies (most are already installed, add missing ones)
-# Note: We install detectron2 from specific commit as required by SAM 3D Body
-RUN pip install \
-    pytorch-lightning \
-    pyrender \
-    yacs \
-    scikit-image \
-    einops \
-    timm \
-    dill \
-    rich \
-    pyrootutils \
-    webdataset \
-    chump \
-    "networkx==3.2.1" \
-    roma \
-    joblib \
-    seaborn \
-    wandb \
-    appdirs \
-    jsonlines \
-    xtcocotools \
-    loguru \
-    optree \
-    fvcore \
-    pycocotools \
-    tensorboard
-
-# Install detectron2 from specific commit (required by SAM 3D Body)
-RUN pip install 'git+https://github.com/facebookresearch/detectron2.git@a1ce2f9' --no-build-isolation --no-deps
 
 # Install gradio for our app (use 5.x which has fixed client)
 RUN pip install "gradio>=5.0.0,<6.0.0"
@@ -163,20 +118,8 @@ open(os.path.join(d,'pt.py'),'w').write('def __getattr__(name):\\n    from . imp
 open(os.path.join(d,'np.py'),'w').write('def __getattr__(name):\\n    from . import numpy\\n    return getattr(numpy, name)\\n'); \
 print('Created pt.py and np.py forwarding modules')"
 
-# PATCH: Add depth_map_to_point_map function (needed by MoGe v2 for SAM 3D Body)
-# Copy the patch file and install it into utils3d
-COPY patches/utils3d_depth_patch.py /tmp/utils3d_depth_patch.py
-RUN python -c "import utils3d, os, shutil; \
-torch_dir = os.path.join(os.path.dirname(utils3d.__file__), 'torch'); \
-shutil.copy('/tmp/utils3d_depth_patch.py', os.path.join(torch_dir, '_depth_patch.py')); \
-init_file = os.path.join(torch_dir, '__init__.py'); \
-open(init_file, 'a').write('\\n# Patch: depth_map_to_point_map for MoGe v2\\nfrom ._depth_patch import depth_map_to_point_map\\n'); \
-print('Installed depth_map_to_point_map patch')"
-
 # Verify utils3d functions
 RUN python -c "from utils3d.pt import intrinsics_from_focal_center; print('utils3d.pt.intrinsics_from_focal_center: OK')"
-RUN python -c "from utils3d.torch import depth_map_to_point_map; print('utils3d.torch.depth_map_to_point_map: OK')"
-RUN python -c "from utils3d.pt import depth_map_to_point_map; print('utils3d.pt.depth_map_to_point_map (via alias): OK')"
 
 # Note: Mask boolean handling is patched at runtime in app.py
 
@@ -197,16 +140,6 @@ RUN ls -la /app/checkpoints/checkpoints/ && \
     test -f /app/checkpoints/checkpoints/pipeline.yaml && \
     echo "SAM 3D Objects checkpoint: OK"
 
-# Download SAM 3D Body checkpoints
-# Note: SAM 3D Body uses a different HuggingFace repo structure
-RUN export $(grep -v '^#' /tmp/.env | grep -v '^$' | xargs) && \
-    python -c "from huggingface_hub import snapshot_download; import os; snapshot_download('facebook/sam-3d-body-dinov3', local_dir='/app/sam3d-body-checkpoints', token=os.environ['HF_TOKEN'])"
-
-# Verify SAM 3D Body checkpoint was downloaded
-RUN ls -la /app/sam3d-body-checkpoints/ && \
-    test -f /app/sam3d-body-checkpoints/model.ckpt && \
-    echo "SAM 3D Body checkpoint: OK"
-
 # Clean up .env file
 RUN rm /tmp/.env
 
@@ -216,10 +149,6 @@ COPY app.py .
 # Environment for runtime
 ENV SAM3D_REPO_PATH=/app/sam-3d-objects
 ENV SAM3D_CHECKPOINT_PATH=/app/checkpoints/checkpoints/pipeline.yaml
-ENV SAM3D_BODY_REPO_PATH=/app/sam-3d-body
-ENV SAM3D_BODY_HF_REPO=facebook/sam-3d-body-dinov3
-# Set for pyrender to use osmesa (headless rendering)
-ENV PYOPENGL_PLATFORM=osmesa
 ENV PORT=8080
 
 EXPOSE 8080
