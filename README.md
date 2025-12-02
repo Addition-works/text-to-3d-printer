@@ -107,10 +107,10 @@ exit
 Run this from your **local terminal** (not SSH):
 
 ```bash
-gcloud compute scp --recurse C:\path\to\text-to-3d-printer text-to-3d-demo:~ --project=text-to-3d-printer --zone=us-west1-a
+gcloud compute scp --recurse C:\Users\machine314\Desktop\text-to-3d-printer text-to-3d-demo: --project=text-to-3d-printer --zone=us-west1-a
 ```
 
-Replace `C:\path\to\text-to-3d-printer` with the actual path to your project folder.
+Replace `C:\Users\machine314\Desktop\text-to-3d-printer` with the actual path to your project folder.
 
 **6. SSH back in:**
 ```bash
@@ -126,7 +126,7 @@ REPLICATE_API_TOKEN=r8_your_token_here
 EOF
 ```
 
-**8. Build the image (~30-45 min):**
+**8. Build the image (~55 min):**
 ```bash
 docker build -t text-to-3d-printer .
 ```
@@ -157,6 +157,73 @@ gcloud compute instances stop text-to-3d-demo ^
 
 ---
 
+## Pushing app.py Revisions to GCE
+
+When you make changes to `app.py`, you don't need to rebuild the Docker image (which takes ~55 min). Instead, use a volume mount to override the file inside the container.
+
+### One-Time Setup
+
+SSH into the VM and create a helper script:
+
+```bash
+gcloud compute ssh text-to-3d-demo --project=text-to-3d-printer --zone=us-west1-a
+```
+
+```bash
+cd ~/text-to-3d-printer
+
+cat > run.sh << 'EOF'
+#!/bin/bash
+echo "Stopping any running containers..."
+docker stop $(docker ps -q) 2>/dev/null
+
+echo "Starting text-to-3d-printer..."
+docker run --gpus all -p 8080:8080 --env-file .env \
+  -v $(pwd)/app.py:/app/app.py:ro \
+  text-to-3d-printer
+EOF
+
+chmod +x run.sh
+```
+
+Then exit:
+```bash
+exit
+```
+
+### Update Workflow
+
+From your **local terminal**, run these commands whenever you change `app.py`:
+
+**1. Copy the updated file to the VM:**
+```bash
+gcloud compute scp C:\Users\machine314\Desktop\text-to-3d-printer\app.py text-to-3d-demo:app.py --project=text-to-3d-printer --zone=us-west1-a
+```
+
+> **Note:** Windows doesn't expand `~`, so we copy to the home directory without a path, then move it after SSH.
+
+**2. SSH in, move the file, and restart:**
+```bash
+gcloud compute ssh text-to-3d-demo --project=text-to-3d-printer --zone=us-west1-a
+```
+
+```bash
+mv ~/app.py ~/text-to-3d-printer/app.py
+cd ~/text-to-3d-printer
+./run.sh
+```
+
+The app will restart with your changes in seconds (no rebuild needed).
+
+### How It Works
+
+The `-v $(pwd)/app.py:/app/app.py:ro` flag mounts your local `app.py` over the one baked into the Docker image:
+- The container still uses all dependencies and model checkpoints from the image
+- Only `app.py` is read from the VM's filesystem
+- `:ro` means read-only (the container can't modify your file)
+
+---
+
 ## Project Structure
 
 ```
@@ -165,6 +232,7 @@ gcloud compute instances stop text-to-3d-demo ^
 ├── .env                            # API tokens (create this yourself)
 ├── download_checkpoints.py         # Helper to download model weights
 ├── README.md                       # This file
+├── run.sh                          # Helper script for quick restarts (created on VM)
 └── patches/
     └── utils3d_depth_patch.py      # Patch for MoGe v2 compatibility
 ```
