@@ -105,7 +105,7 @@ else:
     SAM3D_OBJECTS_AVAILABLE = False
     SAM3DInference = None
 
-# Global inference object (loaded once)
+# Global inference object (loaded once, shared across sessions - this is fine, it's stateless)
 _sam3d_objects_inference = None
 
 
@@ -460,11 +460,14 @@ def convert_to_glb(input_path: str, output_path: str = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gradio Interface
+# Pipeline State (per-session via gr.State)
 # ---------------------------------------------------------------------------
 
-# State to hold data between steps
 class PipelineState:
+    """
+    Holds data between pipeline steps for a single user session.
+    Each browser session gets its own instance via gr.State.
+    """
     def __init__(self):
         self.reset()
     
@@ -478,10 +481,11 @@ class PipelineState:
         self.output_paths = {}
 
 
-state = PipelineState()
+# ---------------------------------------------------------------------------
+# Gradio Step Functions (take and return state for session isolation)
+# ---------------------------------------------------------------------------
 
-
-def step1_generate(prompt: str):
+def step1_generate(prompt: str, state: PipelineState):
     """Generate images from prompt."""
     if not prompt.strip():
         raise gr.Error("Please enter a description of what you want to create.")
@@ -498,10 +502,10 @@ def step1_generate(prompt: str):
     gr.Info("Generating images... This may take 30-60 seconds.")
     state.generated_images = generate_images(prompt=prompt, num_images=NUM_VARIANTS)
     
-    return state.generated_images
+    return state.generated_images, state
 
 
-def step2_select(evt: gr.SelectData):
+def step2_select(evt: gr.SelectData, state: PipelineState):
     """Handle image selection from gallery."""
     state.selected_index = evt.index
     state.selected_image = state.generated_images[evt.index]
@@ -513,10 +517,10 @@ def step2_select(evt: gr.SelectData):
     # Create preview
     preview = create_mask_preview(state.selected_image, state.mask)
     
-    return state.selected_image, preview, gr.update(visible=True)
+    return state.selected_image, preview, gr.update(visible=True), state
 
 
-def step3_regenerate_mask():
+def step3_regenerate_mask(state: PipelineState):
     """Regenerate mask (placeholder for manual adjustment)."""
     if state.selected_image is None:
         raise gr.Error("Please select an image first.")
@@ -526,10 +530,10 @@ def step3_regenerate_mask():
     state.rgba_image, state.mask = segment_object(state.selected_image)
     preview = create_mask_preview(state.selected_image, state.mask)
     
-    return preview
+    return preview, state
 
 
-def step4_reconstruct():
+def step4_reconstruct(state: PipelineState):
     """Run 3D reconstruction."""
     if state.selected_image is None:
         raise gr.Error("Please select an image first.")
@@ -582,14 +586,15 @@ def step4_reconstruct():
         return (
             viewer_path,
             gr.update(value=stl_path, visible=True),
-            gr.update(visible=True)
+            gr.update(visible=True),
+            state,
         )
         
     except Exception as e:
         raise gr.Error(f"3D reconstruction failed: {str(e)}")
 
 
-def step5_download_stl():
+def step5_download_stl(state: PipelineState):
     """Get STL file for download."""
     if "stl" not in state.output_paths:
         raise gr.Error("No STL file available. Please run reconstruction first.")
@@ -605,6 +610,9 @@ def create_ui():
         title="Text to 3D Printer",
         theme=gr.themes.Soft(),
     ) as app:
+        # Per-session state - each user gets their own PipelineState instance
+        state = gr.State(PipelineState)
+        
         gr.Markdown(
             """
             # 🖨️ Text to 3D Printer
@@ -675,29 +683,29 @@ def create_ui():
                 """
             )
         
-        # Wire up events
+        # Wire up events - state is passed as input AND output for session isolation
         generate_btn.click(
             fn=step1_generate,
-            inputs=[prompt_input],
-            outputs=[gallery],
+            inputs=[prompt_input, state],
+            outputs=[gallery, state],
         )
         
         gallery.select(
             fn=step2_select,
-            inputs=[],
-            outputs=[selected_image, mask_preview, mask_group],
+            inputs=[state],
+            outputs=[selected_image, mask_preview, mask_group, state],
         )
         
         regenerate_btn.click(
             fn=step3_regenerate_mask,
-            inputs=[],
-            outputs=[mask_preview],
+            inputs=[state],
+            outputs=[mask_preview, state],
         )
         
         confirm_btn.click(
             fn=step4_reconstruct,
-            inputs=[],
-            outputs=[model_viewer, stl_download, result_group],
+            inputs=[state],
+            outputs=[model_viewer, stl_download, result_group, state],
         )
     
     return app
