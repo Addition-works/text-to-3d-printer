@@ -3,7 +3,7 @@ Text-to-3D-Printer Pipeline
 A Gradio app that generates 3D printable models from text descriptions.
 
 Pipeline:
-1. Text prompt → Generate 4 image variants (Replicate/Stable Diffusion)
+1. Text prompt → Generate image variants (Replicate/Nano Banana)
 2. User selects best image
 3. Auto-segment object from background (rembg)
 4. User confirms mask
@@ -12,6 +12,7 @@ Pipeline:
 7. Preview and download
 """
 
+import base64
 import os
 import sys
 import tempfile
@@ -32,9 +33,17 @@ from rembg import remove
 from dotenv import load_dotenv
 load_dotenv()
 
-REPLICATE_MODEL = "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b"
+REPLICATE_MODEL = "google/nano-banana"
 IMAGE_SIZE = 1024
 NUM_VARIANTS = 2  # Reduced from 4 to save costs
+
+# Default system prompt for 3D-friendly image generation
+DEFAULT_SYSTEM_PROMPT = (
+    "Product photography style, angled view, isolated object, "
+    "plain white background, studio lighting, high detail, sharp focus, drop shadow, "
+    "single object, professional product shot, "
+    "clean edges, suitable for 3D reconstruction"
+)
 
 # SAM 3D Objects paths (set via environment variables in Docker)
 SAM3D_REPO_PATH = os.environ.get("SAM3D_REPO_PATH", "/app/sam-3d-objects")
@@ -121,50 +130,90 @@ def get_sam3d_objects_inference():
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Image Generation (Replicate / Stable Diffusion)
+# Step 1: Image Generation (Replicate / Nano Banana)
 # ---------------------------------------------------------------------------
 
-def generate_images(prompt: str, num_images: int = NUM_VARIANTS) -> list[Image.Image]:
+def upload_image_to_temp_url(image: Image.Image) -> str:
     """
-    Generate images from a text prompt using Stable Diffusion.
+    Convert a PIL Image to a data URI for use with Replicate.
+    Nano Banana accepts base64 data URIs directly.
+    """
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{img_base64}"
+
+
+def generate_images(
+    prompt: str,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    reference_images: list[Image.Image] | None = None,
+    num_images: int = NUM_VARIANTS
+) -> list[Image.Image]:
+    """
+    Generate images from a text prompt using Nano Banana.
     Returns a list of PIL Images.
     
     Args:
         prompt: The user's text prompt
+        system_prompt: Additional context/style instructions
+        reference_images: Optional list of reference images (up to 5)
         num_images: Number of variants to generate
     """
-    # Enhance prompt for clean, product-style images that work well for 3D reconstruction
-    enhanced_prompt = (
-        f"{prompt}, product photography, centered in frame, "
-        f"plain white background, studio lighting, high detail, sharp focus, "
-        f"single object, no shadows, professional product shot"
-    )
-    negative_prompt = (
-        "blurry, multiple objects, cluttered, busy background, "
-        "text, watermark, logo, human hands, person, shadow, "
-        "low quality, distorted, deformed"
-    )
+    # Combine user prompt with system prompt for nano-banana
+    # Nano Banana works best with descriptive, conversational prompts
+    full_prompt = f"{prompt}. {system_prompt}"
+    
+    # Prepare reference images if provided
+    image_inputs = []
+    if reference_images:
+        for img in reference_images[:5]:  # Limit to 5 images
+            if img is not None:
+                # Convert to data URI
+                data_uri = upload_image_to_temp_url(img)
+                image_inputs.append(data_uri)
     
     images = []
     for i in range(num_images):
         print(f"Generating image {i + 1}/{num_images}...")
         try:
+            # Build input dict for nano-banana
+            input_dict = {
+                "prompt": full_prompt,
+                "output_format": "png",
+            }
+            
+            # Add reference images if provided
+            if image_inputs:
+                input_dict["image_input"] = image_inputs
+            
             output = replicate.run(
                 REPLICATE_MODEL,
-                input={
-                    "prompt": enhanced_prompt,
-                    "negative_prompt": negative_prompt,
-                    "width": IMAGE_SIZE,
-                    "height": IMAGE_SIZE,
-                    "num_inference_steps": 30,
-                    "guidance_scale": 7.5,
-                    "seed": i * 42 + 12345,  # Different seed for variety
-                }
+                input=input_dict
             )
             
-            # Output is a list of URLs
-            if output and len(output) > 0:
-                image_url = output[0]
+            print(f"  Output type: {type(output)}, value: {output}")
+            
+            # nano-banana returns a single URI string (not a list)
+            # But also handle FileOutput objects from replicate library
+            if output:
+                # Get the URL from the output
+                if hasattr(output, 'url'):
+                    # FileOutput object
+                    image_url = output.url
+                elif hasattr(output, 'read'):
+                    # File-like object - read directly
+                    img = Image.open(output).convert("RGB")
+                    images.append(img)
+                    continue
+                elif isinstance(output, str):
+                    # Direct URL string
+                    image_url = output
+                else:
+                    print(f"  Warning: Unexpected output format for image {i + 1}: {type(output)}")
+                    print(f"  Output value: {output}")
+                    continue
+                
                 response = requests.get(image_url)
                 img = Image.open(BytesIO(response.content)).convert("RGB")
                 images.append(img)
@@ -473,6 +522,8 @@ class PipelineState:
     
     def reset(self):
         self.prompt = ""
+        self.system_prompt = DEFAULT_SYSTEM_PROMPT
+        self.reference_images = []
         self.generated_images = []
         self.selected_image = None
         self.selected_index = None
@@ -485,7 +536,16 @@ class PipelineState:
 # Gradio Step Functions (take and return state for session isolation)
 # ---------------------------------------------------------------------------
 
-def step1_generate(prompt: str, state: PipelineState):
+def step1_generate(
+    prompt: str,
+    system_prompt: str,
+    ref_img_1: Image.Image | None,
+    ref_img_2: Image.Image | None,
+    ref_img_3: Image.Image | None,
+    ref_img_4: Image.Image | None,
+    ref_img_5: Image.Image | None,
+    state: PipelineState
+):
     """Generate images from prompt."""
     if not prompt.strip():
         raise gr.Error("Please enter a description of what you want to create.")
@@ -498,9 +558,19 @@ def step1_generate(prompt: str, state: PipelineState):
     
     state.reset()
     state.prompt = prompt
+    state.system_prompt = system_prompt
+    
+    # Collect reference images (filter out None)
+    reference_images = [img for img in [ref_img_1, ref_img_2, ref_img_3, ref_img_4, ref_img_5] if img is not None]
+    state.reference_images = reference_images
     
     gr.Info("Generating images... This may take 30-60 seconds.")
-    state.generated_images = generate_images(prompt=prompt, num_images=NUM_VARIANTS)
+    state.generated_images = generate_images(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        reference_images=reference_images,
+        num_images=NUM_VARIANTS
+    )
     
     return state.generated_images, state
 
@@ -555,11 +625,15 @@ def step4_reconstruct(state: PipelineState):
             mask=state.mask
         )
         
+        # Determine paths for both viewers
+        gaussian_viewer_path = None
+        stl_viewer_path = None
+        
         # For Objects mode: show Gaussian Splat PLY directly in viewer
         # Gradio Model3D natively supports .ply/.splat files and renders them
         # with full color, unlike the washed-out mesh conversion
         if "ply" in state.output_paths:
-            viewer_path = state.output_paths["ply"]
+            gaussian_viewer_path = state.output_paths["ply"]
             
             # Convert OBJ mesh to STL for 3D printing (if available)
             if "obj" in state.output_paths:
@@ -573,7 +647,7 @@ def step4_reconstruct(state: PipelineState):
         elif "obj" in state.output_paths:
             glb_path = convert_to_glb(state.output_paths["obj"])
             state.output_paths["glb"] = glb_path
-            viewer_path = glb_path
+            gaussian_viewer_path = glb_path
             
             stl_path = convert_to_stl(state.output_paths["obj"])
             state.output_paths["stl"] = stl_path
@@ -581,10 +655,13 @@ def step4_reconstruct(state: PipelineState):
         else:
             raise gr.Error("No 3D model output found")
         
+        # Set STL viewer path
+        stl_viewer_path = state.output_paths.get("stl")
         stl_path = state.output_paths.get("stl")
         
         return (
-            viewer_path,
+            gaussian_viewer_path,
+            stl_viewer_path,
             gr.update(value=stl_path, visible=True),
             gr.update(visible=True),
             state,
@@ -625,9 +702,10 @@ def create_ui():
             """
         )
         
-        # Step 1: Text Input
+        # Step 1: Text Input and Configuration
         with gr.Group():
             gr.Markdown("### Step 1: Describe Your Object")
+            
             with gr.Row():
                 prompt_input = gr.Textbox(
                     label="Describe your object",
@@ -636,6 +714,26 @@ def create_ui():
                     scale=4,
                 )
                 generate_btn = gr.Button("🎨 Generate Images", variant="primary", scale=1)
+            
+            # System prompt (collapsible)
+            with gr.Accordion("Advanced: Style Prompt", open=False):
+                system_prompt_input = gr.Textbox(
+                    label="Style/System Prompt",
+                    value=DEFAULT_SYSTEM_PROMPT,
+                    lines=3,
+                    info="Additional instructions for the image style. Modify this to change how images are generated.",
+                )
+            
+            # Reference images (collapsible)
+            with gr.Accordion("Optional: Reference Images (up to 5)", open=False):
+                gr.Markdown("*Upload reference images to guide the generation. Nano Banana can blend styles and elements from these.*")
+                with gr.Row():
+                    ref_img_1 = gr.Image(label="Reference 1", type="pil", height=150)
+                    ref_img_2 = gr.Image(label="Reference 2", type="pil", height=150)
+                    ref_img_3 = gr.Image(label="Reference 3", type="pil", height=150)
+                with gr.Row():
+                    ref_img_4 = gr.Image(label="Reference 4", type="pil", height=150)
+                    ref_img_5 = gr.Image(label="Reference 5", type="pil", height=150)
             
             # Show availability status
             status = "✓ SAM 3D Objects available" if SAM3D_OBJECTS_AVAILABLE else "✗ SAM 3D Objects not available"
@@ -668,12 +766,22 @@ def create_ui():
         # Step 4: 3D Preview & Download
         with gr.Group(visible=False) as result_group:
             gr.Markdown("### Step 4: Your 3D Model")
-            model_viewer = gr.Model3D(
-                label="3D Preview (drag to rotate)",
-                clear_color=[0.15, 0.15, 0.15, 1.0],  # Dark background for better visibility
-            )
+            
+            with gr.Row():
+                # Gaussian Splat / colored model viewer
+                gaussian_viewer = gr.Model3D(
+                    label="Gaussian Splat (colored)",
+                    clear_color=[0.15, 0.15, 0.15, 1.0],
+                )
+                # STL viewer for 3D printing preview
+                stl_viewer = gr.Model3D(
+                    label="STL Preview (printable mesh)",
+                    clear_color=[0.2, 0.2, 0.25, 1.0],
+                )
+            
             with gr.Row():
                 stl_download = gr.File(label="📥 Download STL for 3D Printing", visible=False)
+            
             gr.Markdown(
                 """
                 **Tips for 3D printing:**
@@ -686,7 +794,7 @@ def create_ui():
         # Wire up events - state is passed as input AND output for session isolation
         generate_btn.click(
             fn=step1_generate,
-            inputs=[prompt_input, state],
+            inputs=[prompt_input, system_prompt_input, ref_img_1, ref_img_2, ref_img_3, ref_img_4, ref_img_5, state],
             outputs=[gallery, state],
         )
         
@@ -705,7 +813,7 @@ def create_ui():
         confirm_btn.click(
             fn=step4_reconstruct,
             inputs=[state],
-            outputs=[model_viewer, stl_download, result_group, state],
+            outputs=[gaussian_viewer, stl_viewer, stl_download, result_group, state],
         )
     
     return app
@@ -734,6 +842,7 @@ if __name__ == "__main__":
     # Print model availability
     print("\n--- Model Availability ---")
     print(f"SAM 3D Objects: {'✓ Available' if SAM3D_OBJECTS_AVAILABLE else '✗ Not available'}")
+    print(f"Image Model: {REPLICATE_MODEL}")
     print("--------------------------\n")
     
     # Create and launch the app
