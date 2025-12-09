@@ -658,11 +658,13 @@ def step4_reconstruct(state: PipelineState):
         # Set STL viewer path
         stl_viewer_path = state.output_paths.get("stl")
         stl_path = state.output_paths.get("stl")
+        ply_path = state.output_paths.get("ply")
         
         return (
             gaussian_viewer_path,
             stl_viewer_path,
             gr.update(value=stl_path, visible=True),
+            gr.update(value=ply_path, visible=ply_path is not None),
             gr.update(visible=True),
             state,
         )
@@ -782,14 +784,66 @@ def create_ui():
             with gr.Row():
                 stl_download = gr.File(label="📥 Download STL for 3D Printing", visible=False)
             
+            with gr.Row():
+                ply_download = gr.File(label="🎨 Download Color PLY for Full-Color 3D Printing", visible=False)
+            
             gr.Markdown(
                 """
                 **Tips for 3D printing:**
-                - Import the STL file into your slicer software (Cura, PrusaSlicer, etc.)
+                - **STL file**: Import into your slicer (Cura, PrusaSlicer, etc.) for standard single-color printing
+                - **Color PLY file**: Use for full-color 3D printing services (see instructions below)
                 - You may need to scale the model to your desired size
                 - Check for any mesh errors using your slicer's repair tools
                 """
             )
+            
+            with gr.Accordion("Instructions for converting .ply to a color printable format", open=False):
+                gr.Markdown(
+                    """
+# Color 3D Printing Instructions
+
+This PLY file contains a 3D model with embedded vertex colors.
+
+---
+
+## For Full-Color Printing Services
+
+**Recommended services:** Shapeways, Sculpteo, Xometry, i.materialise
+
+### Steps:
+
+1. **Convert PLY to VRML format** (most services require this):
+   - Download [MeshLab](https://www.meshlab.net/) (free)
+   - File → Import Mesh → select the `.ply` file
+   - File → Export Mesh As → save as `.wrl` (VRML 2.0)
+
+2. **Upload to printing service**
+   - Select "Full Color Sandstone" or "Multicolor" material
+   - Scale the model to desired size (it may import very small)
+
+3. **Order print**
+
+---
+
+## For In-House FDM Printers
+
+Standard FDM printers cannot print vertex colors directly. Options:
+
+- **Multi-filament printer** (Bambu AMS, Prusa MMU): Manually assign color regions in slicer
+- **Single color printer**: Print in white/gray, then hand-paint using the on-screen preview as reference
+
+---
+
+## Quick Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| Colors not visible in MeshLab | Render → Color → Per Vertex |
+| Service says "no color data" | Export as VRML (.wrl) instead of OBJ |
+| Model too small | Scale up in slicer or MeshLab |
+| Colors look faded | Normal for vertex colors; original preview has richer color |
+                    """
+                )
         
         # Wire up events - state is passed as input AND output for session isolation
         generate_btn.click(
@@ -813,7 +867,7 @@ def create_ui():
         confirm_btn.click(
             fn=step4_reconstruct,
             inputs=[state],
-            outputs=[gaussian_viewer, stl_viewer, stl_download, result_group, state],
+            outputs=[gaussian_viewer, stl_viewer, stl_download, ply_download, result_group, state],
         )
     
     return app
@@ -837,7 +891,7 @@ if __name__ == "__main__":
     
     # Check for required environment variables
     if not os.environ.get("REPLICATE_API_TOKEN"):
-        print("⚠️  Warning: REPLICATE_API_TOKEN not set. Image generation will fail.")
+        print("⚠  Warning: REPLICATE_API_TOKEN not set. Image generation will fail.")
     
     # Print model availability
     print("\n--- Model Availability ---")
