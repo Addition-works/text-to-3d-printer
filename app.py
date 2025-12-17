@@ -275,7 +275,7 @@ def reconstruct_3d(image: Image.Image, mask: np.ndarray, seed: int = 42) -> dict
     
     The inference code internally calls merge_mask_to_rgba which combines them:
         rgba_image = np.concatenate([image[..., :3], mask], axis=-1)
-    Note: The inference code handles adding the channel dimension to the mask.
+    Note: The inference code handles adding the channel dimension to the mask..
     """
     if not SAM3D_OBJECTS_AVAILABLE:
         raise RuntimeError(
