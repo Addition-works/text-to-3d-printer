@@ -5,11 +5,9 @@ A Gradio app that generates 3D printable models from text descriptions.
 Pipeline:
 1. Text prompt -> Generate image variants (Replicate/Nano Banana)
 2. User selects best image
-3. Auto-segment object from background (rembg)
-4. User confirms mask
-5. Trellis 2 reconstructs 3D model with PBR materials
-6. Export to GLB/GLTF and 3MF for 3D printing
-7. Preview and download
+3. Trellis 2 reconstructs 3D model with PBR materials (handles background removal internally)
+4. Export to GLB/GLTF and 3MF for 3D printing
+5. Preview and download
 """
 
 import base64
@@ -25,7 +23,6 @@ import replicate
 import requests
 import trimesh
 from PIL import Image
-from rembg import remove
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -42,8 +39,9 @@ NUM_VARIANTS = 2  # Reduced from 4 to save costs
 DEFAULT_SYSTEM_PROMPT = (
     "Product photography style, angled view, isolated object, "
     "plain white background, studio lighting, high detail, sharp focus, drop shadow, "
-    "single object, professional product shot, "
-    "clean edges, suitable for 3D reconstruction"
+    "single object, professional product shot, clean edges, suitable for 3D reconstruction. "
+    "No thin surfaces. Simple colors and textures (i.e. no color gradients or complex geometry/topology). "
+    "Very 3d-printer friendly."
 )
 
 # Trellis 2 model path (set via environment variable in Docker)
@@ -206,46 +204,15 @@ def generate_images(
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Segmentation (rembg for background removal)
+# Step 2: 3D Reconstruction (Trellis 2)
 # ---------------------------------------------------------------------------
 
-def segment_object(image: Image.Image) -> tuple[Image.Image, np.ndarray]:
-    """
-    Remove background and create a binary mask for the object.
-    Returns (RGBA image with transparent background, binary mask as numpy array).
-    """
-    # Use rembg to remove background
-    rgba_image = remove(image)
-
-    # Extract alpha channel as mask
-    alpha = np.array(rgba_image)[:, :, 3]
-    mask = (alpha > 128).astype(np.uint8) * 255
-
-    return rgba_image, mask
-
-
-def create_mask_preview(image: Image.Image, mask: np.ndarray) -> Image.Image:
-    """Create a visual preview of the mask overlaid on the image."""
-    img_array = np.array(image.convert("RGB"))
-
-    # Create red overlay where mask is active
-    overlay = img_array.copy()
-    mask_bool = mask > 128
-    overlay[mask_bool] = overlay[mask_bool] * 0.5 + np.array([255, 0, 0]) * 0.5
-
-    return Image.fromarray(overlay.astype(np.uint8))
-
-
-# ---------------------------------------------------------------------------
-# Step 3: 3D Reconstruction (Trellis 2)
-# ---------------------------------------------------------------------------
-
-def reconstruct_3d(image: Image.Image, mask: np.ndarray, seed: int = 42) -> dict:
+def reconstruct_3d(image: Image.Image, seed: int = 42) -> dict:
     """
     Use Trellis 2 to reconstruct a 3D model from an image.
 
-    Trellis 2 takes an image (with optional background removal) and generates
-    a full 3D mesh with PBR materials (base color, roughness, metallic, opacity).
+    Trellis 2 handles background removal internally via rembg during preprocessing.
+    It generates a full 3D mesh with PBR materials (base color, roughness, metallic, opacity).
 
     Returns dict with paths to output files.
     """
@@ -263,19 +230,8 @@ def reconstruct_3d(image: Image.Image, mask: np.ndarray, seed: int = 42) -> dict
     debug_dir = "/tmp/trellis_debug"
     os.makedirs(debug_dir, exist_ok=True)
 
-    # Trellis 2 works best with the object on a clean background
-    # Apply the mask to create an RGBA image with transparent background
-    if image.mode != "RGBA":
-        image = image.convert("RGBA")
-
-    # Apply mask as alpha channel
-    img_array = np.array(image)
-    if len(mask.shape) == 2:
-        img_array[:, :, 3] = mask
-    image = Image.fromarray(img_array, mode="RGBA")
-
     # Save debug image
-    image.save(f"{debug_dir}/input_image_rgba.png")
+    image.save(f"{debug_dir}/input_image.png")
     print(f"Debug images saved to {debug_dir}")
 
     # Preprocess image for Trellis 2
@@ -416,53 +372,425 @@ def convert_to_stl(input_path: str, output_path: str = None) -> str:
 
 def convert_to_3mf(input_path: str, output_path: str = None) -> str:
     """
-    Convert a GLB model to 3MF format using PyMeshLab.
-    Transfers texture colors to vertex colors for full-color 3D printing.
-    Returns path to the 3MF file, or None if conversion failed.
+    Convert a GLB model to 3MF format with full vertex colors using lib3mf.
+
+    lib3mf is the official 3MF Consortium library and properly supports
+    vertex colors via ColorGroups, which PyMeshLab does not.
+
+    Returns path to the 3MF file.
+    Raises an exception if conversion fails or color data is lost.
     """
     if output_path is None:
         output_dir = os.path.dirname(input_path)
         output_path = os.path.join(output_dir, "model.3mf")
 
-    print(f"Converting {input_path} to 3MF with PyMeshLab...")
+    print(f"Converting {input_path} to 3MF with lib3mf...")
 
+    import lib3mf
+    from lib3mf import get_wrapper
+
+    # Load the GLB with trimesh to get vertices, faces, and colors
+    # force='mesh' converts Scene to single Trimesh by concatenating all geometries
+    mesh = trimesh.load(input_path, force='mesh')
+
+    print(f"  Loaded mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+
+    # Get vertex colors - handle both vertex color and texture-based visuals
+    vertex_colors = None
+
+    # Check for direct vertex colors first
+    if hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None:
+        vc = mesh.visual.vertex_colors
+        # Verify it's not all the same default color
+        if len(vc) == len(mesh.vertices) and not np.all(vc == vc[0]):
+            vertex_colors = vc
+            print(f"  Has vertex colors: True ({len(vertex_colors)} colors)")
+
+    # If no vertex colors, try to convert from texture
+    if vertex_colors is None and hasattr(mesh.visual, 'to_color'):
+        print("  Converting texture to vertex colors...")
+        try:
+            color_visual = mesh.visual.to_color()
+            if hasattr(color_visual, 'vertex_colors') and color_visual.vertex_colors is not None:
+                vertex_colors = color_visual.vertex_colors
+                print(f"  Converted to vertex colors: {len(vertex_colors)} colors")
+        except Exception as e:
+            print(f"  Warning: Could not convert texture to vertex colors: {e}")
+
+    if vertex_colors is None:
+        raise RuntimeError(
+            "GLB file has no vertex colors and texture conversion failed. "
+            "Check that O-Voxel exported colors correctly."
+        )
+
+    # Create lib3mf model using recommended get_wrapper() function
+    wrapper = get_wrapper()
+    model = wrapper.CreateModel()
+
+    # Create mesh object
+    mesh_object = model.AddMeshObject()
+    mesh_object.SetName("ColoredMesh")
+
+    # Add vertices - lib3mf Position uses .Coordinates array
+    vertices = mesh.vertices.astype(np.float64)
+    for v in vertices:
+        pos = lib3mf.Position()
+        pos.Coordinates[0] = float(v[0])
+        pos.Coordinates[1] = float(v[1])
+        pos.Coordinates[2] = float(v[2])
+        mesh_object.AddVertex(pos)
+
+    # Add triangles - lib3mf Triangle uses .Indices array
+    faces = mesh.faces.astype(np.uint32)
+    for f in faces:
+        tri = lib3mf.Triangle()
+        tri.Indices[0] = int(f[0])
+        tri.Indices[1] = int(f[1])
+        tri.Indices[2] = int(f[2])
+        mesh_object.AddTriangle(tri)
+
+    # Create color group for vertex colors
+    color_group = model.AddColorGroup()
+
+    # Build a map of unique colors to color IDs to avoid duplicates
+    # Colors are RGBA 0-255, convert to lib3mf Color format
+    color_to_id = {}
+
+    def get_color_id(rgba):
+        """Get or create a color ID for the given RGBA tuple."""
+        key = tuple(rgba[:3])  # Use RGB as key (ignore alpha for now)
+        if key not in color_to_id:
+            # lib3mf Color uses .Red, .Green, .Blue, .Alpha fields
+            color = lib3mf.Color()
+            color.Red = int(rgba[0])
+            color.Green = int(rgba[1])
+            color.Blue = int(rgba[2])
+            color.Alpha = int(rgba[3]) if len(rgba) > 3 else 255
+            color_id = color_group.AddColor(color)
+            color_to_id[key] = color_id
+        return color_to_id[key]
+
+    # Set triangle properties with per-vertex colors
+    print("  Assigning vertex colors to triangles...")
+    resource_id = color_group.GetResourceID()
+
+    for i, face in enumerate(faces):
+        # Get the color for each vertex of this triangle
+        c0 = vertex_colors[face[0]]
+        c1 = vertex_colors[face[1]]
+        c2 = vertex_colors[face[2]]
+
+        id0 = get_color_id(c0)
+        id1 = get_color_id(c1)
+        id2 = get_color_id(c2)
+
+        # Create triangle properties - uses .ResourceID and .PropertyIDs array
+        props = lib3mf.TriangleProperties()
+        props.ResourceID = resource_id
+        props.PropertyIDs[0] = id0
+        props.PropertyIDs[1] = id1
+        props.PropertyIDs[2] = id2
+        mesh_object.SetTriangleProperties(i, props)
+
+    print(f"  Created {len(color_to_id)} unique colors")
+
+    # Set object-level property (required for colors to work)
+    mesh_object.SetObjectLevelProperty(resource_id, 1)
+
+    # Add mesh to build items
+    model.AddBuildItem(mesh_object, wrapper.GetIdentityTransform())
+
+    # Write to file
+    writer = model.QueryWriter("3mf")
+    writer.WriteToFile(output_path)
+
+    print(f"  Saved 3MF with vertex colors: {output_path}")
+
+    return output_path
+
+
+def convert_to_3mf_printable(input_path: str, output_path: str = None) -> str:
+    """
+    Convert a GLB model to a print-ready 3MF format using PyMeshLab.
+
+    This version applies mesh repair operations to fix common issues that
+    cause problems with 3D printing, such as holes, non-manifold geometry,
+    and floating debris.
+
+    Repair steps applied:
+    ─────────────────────────────────────────────────────────────────────────
+    1. Remove duplicate vertices
+       - Filter: meshing_remove_duplicate_vertices
+       - Merges vertices closer than 0.01% of bounding box diagonal
+
+    2. Remove duplicate faces
+       - Filter: meshing_remove_duplicate_faces
+
+    3. Remove zero-area faces
+       - Filter: meshing_remove_null_faces
+
+    4. Remove unreferenced vertices
+       - Filter: meshing_remove_unreferenced_vertices
+
+    5. Remove small disconnected components
+       - Filter: meshing_remove_connected_component_by_diameter
+       - Removes floating pieces smaller than 5% of main model diameter
+
+    6. Repair non-manifold edges
+       - Filter: meshing_repair_non_manifold_edges
+       - Fixes edges shared by more than 2 faces (required for watertight mesh)
+
+    7. Repair non-manifold vertices
+       - Filter: meshing_repair_non_manifold_vertices
+       - Splits vertices shared by non-adjacent face fans
+
+    8. Close small holes
+       - Filter: meshing_close_holes
+       - Closes holes with up to 100 edges
+       - Preserves vertex colors on filled regions
+    ─────────────────────────────────────────────────────────────────────────
+
+    Returns path to the 3MF file.
+    Raises an exception if conversion fails or color data is lost.
+    """
+    if output_path is None:
+        output_dir = os.path.dirname(input_path)
+        output_path = os.path.join(output_dir, "model_printable.3mf")
+
+    print(f"Converting {input_path} to print-ready 3MF...")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step 1: Use trimesh to convert texture to vertex colors
+    # PyMeshLab can't access embedded textures in GLB files, so we use trimesh
+    # which properly handles embedded textures via to_color()
+    # ─────────────────────────────────────────────────────────────────────────
+    print("  Loading GLB with trimesh for color extraction...")
+    tm_mesh = trimesh.load(input_path, force='mesh')
+    print(f"  Loaded mesh: {len(tm_mesh.vertices)} vertices, {len(tm_mesh.faces)} faces")
+
+    # Convert texture to vertex colors using trimesh
+    vertex_colors = None
+    if hasattr(tm_mesh.visual, 'vertex_colors') and tm_mesh.visual.vertex_colors is not None:
+        vc = tm_mesh.visual.vertex_colors
+        if len(vc) == len(tm_mesh.vertices) and not np.all(vc == vc[0]):
+            vertex_colors = vc
+            print(f"  Found existing vertex colors: {len(vertex_colors)} colors")
+
+    if vertex_colors is None and hasattr(tm_mesh.visual, 'to_color'):
+        print("  Converting texture to vertex colors...")
+        try:
+            color_visual = tm_mesh.visual.to_color()
+            if hasattr(color_visual, 'vertex_colors') and color_visual.vertex_colors is not None:
+                vertex_colors = color_visual.vertex_colors
+                tm_mesh.visual = color_visual  # Apply the vertex colors to mesh
+                print(f"  Converted to vertex colors: {len(vertex_colors)} colors")
+        except Exception as e:
+            print(f"  Warning: Could not convert texture to vertex colors: {e}")
+
+    if vertex_colors is None:
+        raise RuntimeError(
+            "GLB file has no vertex colors and texture conversion failed. "
+            "Check that O-Voxel exported colors correctly."
+        )
+
+    # Save as PLY with vertex colors for PyMeshLab
+    # PLY format preserves vertex colors and PyMeshLab can read it
+    temp_ply = os.path.join(os.path.dirname(input_path), "temp_colored.ply")
+    tm_mesh.export(temp_ply, file_type='ply')
+    print(f"  Saved temporary PLY with vertex colors")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step 2: Load into PyMeshLab for mesh repairs
+    # ─────────────────────────────────────────────────────────────────────────
+    import pymeshlab
+
+    ms = pymeshlab.MeshSet()
+    ms.load_new_mesh(temp_ply)
+
+    mesh = ms.current_mesh()
+    print(f"  PyMeshLab loaded: {mesh.vertex_number()} vertices, {mesh.face_number()} faces")
+    print(f"  Has vertex colors: {mesh.has_vertex_color()}")
+
+    if not mesh.has_vertex_color():
+        raise RuntimeError(
+            "Vertex colors were not preserved in PLY transfer. "
+            "This is unexpected - please report this issue."
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Mesh repair operations for 3D printing
+    # ─────────────────────────────────────────────────────────────────────────
+    print("  Applying mesh repairs for 3D printing...")
+
+    initial_vertices = ms.current_mesh().vertex_number()
+    initial_faces = ms.current_mesh().face_number()
+
+    # 1. Remove duplicate vertices (within 0.01% of bounding box diagonal)
+    print("    - Removing duplicate vertices...")
+    ms.meshing_remove_duplicate_vertices()
+
+    # 2. Remove duplicate faces
+    print("    - Removing duplicate faces...")
+    ms.meshing_remove_duplicate_faces()
+
+    # 3. Remove zero-area (null/degenerate) faces
+    print("    - Removing zero-area faces...")
+    ms.meshing_remove_null_faces()
+
+    # 4. Remove unreferenced vertices (orphans)
+    print("    - Removing unreferenced vertices...")
+    ms.meshing_remove_unreferenced_vertices()
+
+    # 5. Remove small floating components (debris)
+    #    Removes components smaller than 5% of the largest component's diameter
+    print("    - Removing small disconnected components (<5% diameter)...")
     try:
-        import pymeshlab
-
-        # Create a new MeshSet
-        ms = pymeshlab.MeshSet()
-
-        # Load the GLB file
-        ms.load_new_mesh(input_path)
-
-        # Get mesh info
-        mesh = ms.current_mesh()
-        print(f"  Loaded mesh: {mesh.vertex_number()} vertices, {mesh.face_number()} faces")
-        print(f"  Has vertex colors: {mesh.has_vertex_color()}")
-        print(f"  Has textures: {mesh.has_wedge_tex_coord()}")
-
-        # If mesh has textures but no vertex colors, transfer texture to vertex colors
-        if mesh.has_wedge_tex_coord() and not mesh.has_vertex_color():
-            print("  Transferring texture colors to vertex colors...")
-            ms.transfer_texture_to_color_per_vertex()
-
-        # Remove texture references so 3MF export doesn't try to save them
-        # 3MF with vertex colors is what we want for multi-color 3D printing
-        if mesh.has_wedge_tex_coord():
-            print("  Converting textured mesh to vertex colors for 3MF...")
-            ms.transfer_texture_to_color_per_vertex()
-
-        # Export to 3MF without textures (vertex colors only)
-        ms.save_current_mesh(output_path, save_textures=False)
-        print(f"  Saved 3MF: {output_path}")
-
-        return output_path
-
+        ms.meshing_remove_connected_component_by_diameter(
+            mincomponentdiag=pymeshlab.PercentageValue(5.0)
+        )
     except Exception as e:
-        print(f"  Warning: 3MF export with PyMeshLab failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        print(f"      Warning: Could not remove small components: {e}")
+
+    # 6. Repair non-manifold edges (edges shared by more than 2 faces)
+    print("    - Repairing non-manifold edges...")
+    try:
+        ms.meshing_repair_non_manifold_edges()
+    except Exception as e:
+        print(f"      Warning: Could not repair non-manifold edges: {e}")
+
+    # 7. Repair non-manifold vertices (vertices with non-adjacent face fans)
+    print("    - Repairing non-manifold vertices...")
+    try:
+        ms.meshing_repair_non_manifold_vertices()
+    except Exception as e:
+        print(f"      Warning: Could not repair non-manifold vertices: {e}")
+
+    # 8. Close small holes (up to 100 edges)
+    print("    - Closing small holes (up to 100 edges)...")
+    try:
+        ms.meshing_close_holes(maxholesize=100)
+    except Exception as e:
+        print(f"      Warning: Could not close holes: {e}")
+
+    # Report changes
+    final_vertices = ms.current_mesh().vertex_number()
+    final_faces = ms.current_mesh().face_number()
+    print(f"  Mesh repair complete:")
+    print(f"    Vertices: {initial_vertices} -> {final_vertices} ({final_vertices - initial_vertices:+d})")
+    print(f"    Faces: {initial_faces} -> {final_faces} ({final_faces - initial_faces:+d})")
+
+    # Verify colors still exist after repairs
+    mesh = ms.current_mesh()
+    if not mesh.has_vertex_color():
+        raise RuntimeError(
+            "Vertex colors were lost during mesh repair operations. "
+            "This is unexpected - please report this issue."
+        )
+
+    # Extract data directly from PyMeshLab (avoids PLY texture save issues)
+    import lib3mf
+    from lib3mf import get_wrapper
+
+    # Get the current mesh and compact it to ensure contiguous arrays
+    # compact() is a Mesh method, not MeshSet method
+    mesh = ms.current_mesh()
+    mesh.compact()
+
+    # Get vertices, faces, and colors directly from PyMeshLab
+    vertices = mesh.vertex_matrix()  # #V x 3 numpy array
+    faces = mesh.face_matrix()  # #F x 3 numpy array
+    # vertex_color_matrix returns #V x 4 floats in [0,1] range (RGBA)
+    vertex_colors_float = mesh.vertex_color_matrix()
+    # Convert to 0-255 range for lib3mf
+    vertex_colors = (vertex_colors_float * 255).astype(np.uint8)
+
+    print(f"  Extracted from PyMeshLab: {len(vertices)} vertices, {len(faces)} faces, {len(vertex_colors)} colors")
+
+    # Create lib3mf model using recommended get_wrapper() function
+    wrapper = get_wrapper()
+    model = wrapper.CreateModel()
+
+    # Create mesh object
+    mesh_object = model.AddMeshObject()
+    mesh_object.SetName("PrintReadyMesh")
+
+    # Add vertices - lib3mf Position uses .Coordinates array
+    for v in vertices:
+        pos = lib3mf.Position()
+        pos.Coordinates[0] = float(v[0])
+        pos.Coordinates[1] = float(v[1])
+        pos.Coordinates[2] = float(v[2])
+        mesh_object.AddVertex(pos)
+
+    # Add triangles - lib3mf Triangle uses .Indices array
+    for f in faces:
+        tri = lib3mf.Triangle()
+        tri.Indices[0] = int(f[0])
+        tri.Indices[1] = int(f[1])
+        tri.Indices[2] = int(f[2])
+        mesh_object.AddTriangle(tri)
+
+    # Create color group for vertex colors
+    color_group = model.AddColorGroup()
+
+    # Build a map of unique colors to color IDs
+    color_to_id = {}
+
+    def get_color_id(rgba):
+        key = (int(rgba[0]), int(rgba[1]), int(rgba[2]))
+        if key not in color_to_id:
+            # lib3mf Color uses .Red, .Green, .Blue, .Alpha fields
+            color = lib3mf.Color()
+            color.Red = int(rgba[0])
+            color.Green = int(rgba[1])
+            color.Blue = int(rgba[2])
+            color.Alpha = int(rgba[3]) if len(rgba) > 3 else 255
+            color_id = color_group.AddColor(color)
+            color_to_id[key] = color_id
+        return color_to_id[key]
+
+    # Set triangle properties with per-vertex colors
+    print("  Assigning vertex colors to triangles...")
+    resource_id = color_group.GetResourceID()
+
+    for i, face in enumerate(faces):
+        c0 = vertex_colors[face[0]]
+        c1 = vertex_colors[face[1]]
+        c2 = vertex_colors[face[2]]
+
+        id0 = get_color_id(c0)
+        id1 = get_color_id(c1)
+        id2 = get_color_id(c2)
+
+        # Create triangle properties - uses .ResourceID and .PropertyIDs array
+        props = lib3mf.TriangleProperties()
+        props.ResourceID = resource_id
+        props.PropertyIDs[0] = id0
+        props.PropertyIDs[1] = id1
+        props.PropertyIDs[2] = id2
+        mesh_object.SetTriangleProperties(i, props)
+
+    print(f"  Created {len(color_to_id)} unique colors")
+
+    # Set object-level property
+    mesh_object.SetObjectLevelProperty(resource_id, 1)
+
+    # Add mesh to build items
+    model.AddBuildItem(mesh_object, wrapper.GetIdentityTransform())
+
+    # Write to file
+    writer = model.QueryWriter("3mf")
+    writer.WriteToFile(output_path)
+
+    # Clean up temporary PLY file
+    try:
+        os.remove(temp_ply)
+    except Exception:
+        pass
+
+    print(f"  Saved print-ready 3MF with vertex colors: {output_path}")
+
+    return output_path
 
 
 def convert_to_glb_viewer(input_path: str, output_path: str = None) -> str:
@@ -504,8 +832,6 @@ class PipelineState:
         self.generated_images = []
         self.selected_image = None
         self.selected_index = None
-        self.mask = None
-        self.rgba_image = None
         self.output_paths = {}
 
 
@@ -557,36 +883,13 @@ def step2_select(evt: gr.SelectData, state: PipelineState):
     state.selected_index = evt.index
     state.selected_image = state.generated_images[evt.index]
 
-    # Auto-segment the selected image
-    gr.Info("Segmenting object from background...")
-    state.rgba_image, state.mask = segment_object(state.selected_image)
-
-    # Create preview
-    preview = create_mask_preview(state.selected_image, state.mask)
-
-    return state.selected_image, preview, gr.update(visible=True), state
+    return state.selected_image, gr.update(visible=True), state
 
 
-def step3_regenerate_mask(state: PipelineState):
-    """Regenerate mask (placeholder for manual adjustment)."""
-    if state.selected_image is None:
-        raise gr.Error("Please select an image first.")
-
-    # For now, just re-run segmentation
-    # In a more advanced version, you could allow manual mask editing
-    state.rgba_image, state.mask = segment_object(state.selected_image)
-    preview = create_mask_preview(state.selected_image, state.mask)
-
-    return preview, state
-
-
-def step4_reconstruct(state: PipelineState):
+def step3_reconstruct(state: PipelineState):
     """Run 3D reconstruction with Trellis 2."""
     if state.selected_image is None:
         raise gr.Error("Please select an image first.")
-
-    if state.mask is None:
-        raise gr.Error("Please select an image and confirm the mask first.")
 
     if not TRELLIS_AVAILABLE:
         raise gr.Error(
@@ -597,10 +900,7 @@ def step4_reconstruct(state: PipelineState):
     gr.Info("Reconstructing 3D Object with Trellis 2... This may take 30-90 seconds.")
 
     try:
-        state.output_paths = reconstruct_3d(
-            image=state.selected_image,
-            mask=state.mask
-        )
+        state.output_paths = reconstruct_3d(image=state.selected_image)
 
         # Primary output is GLB with full colors and materials
         if "glb" not in state.output_paths:
@@ -608,15 +908,22 @@ def step4_reconstruct(state: PipelineState):
 
         glb_path = state.output_paths["glb"]
 
-        # Convert GLB to 3MF for 3D printing
+        # Convert GLB to 3MF for 3D printing (standard version)
         gr.Info("Converting to 3MF format for 3D printing...")
         threemf_path = convert_to_3mf(glb_path)
         if threemf_path:
             state.output_paths["3mf"] = threemf_path
 
+        # Convert GLB to print-ready 3MF (with mesh repairs)
+        gr.Info("Creating print-ready 3MF with mesh repairs...")
+        threemf_printable_path = convert_to_3mf_printable(glb_path)
+        if threemf_printable_path:
+            state.output_paths["3mf_printable"] = threemf_printable_path
+
         return (
             glb_path,  # Use GLB for preview (Gradio doesn't support 3MF rendering)
-            gr.update(value=threemf_path, visible=threemf_path is not None),  # 3MF download
+            threemf_path,  # 3MF download
+            threemf_printable_path,  # Print-ready 3MF
             gr.update(visible=True),  # Result group
             state,
         )
@@ -648,11 +955,10 @@ def create_ui():
             """
             # Text to 3D Printer
 
-            Transform your ideas into 3D printable models in 4 simple steps:
+            Transform your ideas into 3D printable models in 3 simple steps:
             1. **Describe** what you want to create
             2. **Select** the best generated image
-            3. **Confirm** the object mask
-            4. **Download** your 3D printable files (GLB, STL, 3MF)
+            3. **Download** your 3D printable files (GLB, 3MF)
 
             *Powered by Microsoft Trellis 2 - generates 3D models with full PBR materials and colors*
             """
@@ -708,20 +1014,15 @@ def create_ui():
                 allow_preview=False,
             )
 
-        # Step 3: Mask Confirmation
-        with gr.Group(visible=False) as mask_group:
-            gr.Markdown("### Step 3: Confirm Selection")
-            gr.Markdown("*The red overlay shows what will be converted to 3D*")
-            with gr.Row():
-                selected_image = gr.Image(label="Selected Image", type="pil")
-                mask_preview = gr.Image(label="Object Mask Preview", type="pil")
-            with gr.Row():
-                regenerate_btn = gr.Button("Regenerate Mask", variant="secondary")
-                confirm_btn = gr.Button("Confirm & Generate 3D", variant="primary")
+        # Step 2b: Confirm Selection
+        with gr.Group(visible=False) as confirm_group:
+            gr.Markdown("### Confirm Selection")
+            selected_image = gr.Image(label="Selected Image", type="pil")
+            confirm_btn = gr.Button("Generate 3D Model", variant="primary", size="lg")
 
-        # Step 4: 3D Preview & Download
+        # Step 3: 3D Preview & Download
         with gr.Group(visible=False) as result_group:
-            gr.Markdown("### Step 4: Your 3D Model")
+            gr.Markdown("### Step 3: Your 3D Model")
 
             # 3D model preview (using GLB since Gradio doesn't support 3MF rendering)
             threemf_viewer = gr.Model3D(
@@ -732,13 +1033,17 @@ def create_ui():
 
             gr.Markdown("### Download")
 
-            threemf_download = gr.File(label="Download 3MF (3D Print Ready)", visible=False)
+            threemf_download = gr.File(label="Download 3MF (Original)")
+            threemf_printable_download = gr.File(label="Download 3MF (Print-Ready, Repaired)")
 
             gr.Markdown(
                 """
                 **3MF Format:** 3D printing format with vertex colors. Compatible with Bambu Studio, PrusaSlicer, Cura, and most slicers.
 
-                *Note: Preview shows GLB render. Download the 3MF file for printing.*
+                - **Original:** Direct conversion with colors, no mesh modifications
+                - **Print-Ready:** Includes mesh repairs (hole filling, manifold fixes, debris removal)
+
+                *Note: Preview shows GLB render. Download the 3MF files for printing.*
                 """
             )
 
@@ -752,19 +1057,13 @@ def create_ui():
         gallery.select(
             fn=step2_select,
             inputs=[state],
-            outputs=[selected_image, mask_preview, mask_group, state],
-        )
-
-        regenerate_btn.click(
-            fn=step3_regenerate_mask,
-            inputs=[state],
-            outputs=[mask_preview, state],
+            outputs=[selected_image, confirm_group, state],
         )
 
         confirm_btn.click(
-            fn=step4_reconstruct,
+            fn=step3_reconstruct,
             inputs=[state],
-            outputs=[threemf_viewer, threemf_download, result_group, state],
+            outputs=[threemf_viewer, threemf_download, threemf_printable_download, result_group, state],
         )
 
     return app

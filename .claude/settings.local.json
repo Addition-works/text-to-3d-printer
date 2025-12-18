@@ -6,7 +6,12 @@
       "Bash(docker run --rm text-to-3d-printer bash -c \"find /app/TRELLIS.2 -name ''*.py'' | head -50\")",
       "Bash(docker run --rm text-to-3d-printer bash -c \"find /app/TRELLIS.2 -name ''*pipeline*'' -o -name ''*Pipeline*''\")",
       "Bash(docker run --rm text-to-3d-printer bash -c \"ls -la /app/TRELLIS.2/trellis2/pipelines/\")",
-      "Bash(docker run --rm text-to-3d-printer bash -c \"cat /app/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py\")"
+      "Bash(docker run --rm text-to-3d-printer bash -c \"cat /app/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py\")",
+      "Bash(git log:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python3:*)",
+      "Bash(pip show:*)",
+      "Bash(grep:*)"
     ]
   }
 }
