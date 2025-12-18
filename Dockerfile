@@ -131,14 +131,16 @@ RUN pip install \
     replicate \
     Pillow \
     "trimesh[easy]" \
-    rembg \
-    onnxruntime \
     requests \
     python-dotenv \
     huggingface_hub
 
-# Install PyMeshLab for GLB to 3MF conversion with vertex colors
+# Install PyMeshLab for mesh repair operations
 RUN pip install pymeshlab
+
+# Install lib3mf for proper 3MF export with vertex colors
+# (PyMeshLab doesn't support 3MF vertex colors, lib3mf is the official 3MF library)
+RUN pip install lib3mf
 
 # Create pt and np aliases for utils3d compatibility (if needed)
 RUN python -c "import utils3d, os; d=os.path.dirname(utils3d.__file__); \
