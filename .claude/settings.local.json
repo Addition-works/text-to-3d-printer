@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker run --rm text-to-3d-printer conda run -n trellis2 python -c \"\nfrom trellis.pipelines import Trellis2ImageTo3DPipeline\nimport inspect\n\n# Get the run method signature\nsig = inspect.signature(Trellis2ImageTo3DPipeline.run)\nprint(''run() signature:'', sig)\nprint()\n\n# Get the docstring\nprint(''run() docstring:'')\nprint(Trellis2ImageTo3DPipeline.run.__doc__)\n\")",
+      "Bash(docker run --rm text-to-3d-printer bash -c \"cat /app/TRELLIS.2/trellis/pipelines/*.py | head -500\")",
+      "Bash(docker run --rm text-to-3d-printer bash -c \"find /app/TRELLIS.2 -name ''*.py'' | head -50\")",
+      "Bash(docker run --rm text-to-3d-printer bash -c \"find /app/TRELLIS.2 -name ''*pipeline*'' -o -name ''*Pipeline*''\")",
+      "Bash(docker run --rm text-to-3d-printer bash -c \"ls -la /app/TRELLIS.2/trellis2/pipelines/\")",
+      "Bash(docker run --rm text-to-3d-printer bash -c \"cat /app/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py\")"
+    ]
+  }
+}
