@@ -1,89 +1,148 @@
 # text-to-3d-printer
 
-Generate 3D printable models from text descriptions using SAM 3D Objects.
+Generate 3D printable models from text descriptions using Microsoft Trellis 2.
 
 **Pipeline:**
-1. Text prompt → Generate images (Stable Diffusion via Replicate)
+1. Text prompt → Generate images (Nano Banana via Replicate)
 2. Select best image
-3. Auto-segment object from background
-4. Reconstruct 3D model (SAM 3D Objects)
-5. Download STL for 3D printing
+3. Auto-segment object from background (rembg)
+4. Reconstruct 3D model with PBR materials (Trellis 2)
+5. Download GLB, STL, or 3MF for 3D printing
 
-**Modes:**
-- 🎁 **Objects** - General objects, products, items (uses SAM 3D Objects)
+**Output Formats:**
+- **GLB/GLTF** - Full color with PBR materials (roughness, metallic, opacity)
+- **STL** - Standard format for FDM/SLA printers
+- **3MF** - Modern format with color support for multi-material printers
 
 ## Prerequisites
 
-- NVIDIA GPU (RTX 3090 or similar recommended)
-- HuggingFace account with license accepted:
-  - [SAM 3D Objects](https://huggingface.co/facebook/sam-3d-objects)
+- **NVIDIA GPU with 24GB+ VRAM** (RTX 3090, RTX 4090, L4, A100, or similar)
+- **Docker** with NVIDIA Container Toolkit
+- **API Keys:**
+  - Replicate API token (for image generation)
+  - HuggingFace token (optional, for faster model downloads)
 
-## Setup
+## Quick Start
 
-### Option 1: Local (Docker)
+### 1. Create `.env` file
 
-**1. Install prerequisites:**
-- Docker Desktop with WSL 2 backend (Windows) or Docker (Linux)
-- NVIDIA GPU drivers + NVIDIA Container Toolkit
-
-**2. Create `.env` file:**
-```
-HF_TOKEN=hf_your_token_here
+```bash
 REPLICATE_API_TOKEN=r8_your_token_here
+HF_TOKEN=hf_your_token_here  # Optional but recommended
 ```
 
 Get tokens from:
-- HuggingFace: https://huggingface.co/settings/tokens
 - Replicate: https://replicate.com/account/api-tokens
+- HuggingFace: https://huggingface.co/settings/tokens
 
-**3. Build and run:**
+### 2. Build the Docker image
+
 ```bash
-docker build -t text-to-3d-printer .
+# Linux/Mac
+./build.sh
+
+# Windows (in WSL or Git Bash)
+bash build.sh
+```
+
+Build takes ~45-60 minutes and creates a ~50-60GB image.
+
+### 3. Run the container
+
+```bash
 docker run --gpus all -p 8080:8080 --env-file .env text-to-3d-printer
 ```
 
-Open http://localhost:8080
+Open http://localhost:8080 in your browser.
 
 ---
 
-### Option 2: Google Cloud Compute Engine
+## Local Development (RTX 3090/4090)
 
-**1. Create the VM with GPU:**
+For development on a local workstation with an RTX 3090 or 4090:
 
-> **Note:** GPU availability varies by zone. If a zone is exhausted, try another (us-west1-b, us-east4-c, europe-west4-a, etc.)
+### Prerequisites
+
+- Docker Desktop with WSL 2 backend (Windows) or Docker (Linux)
+- NVIDIA GPU drivers (535+ recommended)
+- NVIDIA Container Toolkit
+
+### Install NVIDIA Container Toolkit (Linux)
 
 ```bash
-gcloud compute instances create text-to-3d-demo ^
-  --project=text-to-3d-printer ^
-  --zone=us-west1-a ^
-  --machine-type=g2-standard-8 ^
-  --accelerator=type=nvidia-l4,count=1 ^
-  --boot-disk-size=200GB ^
-  --image-family=ubuntu-2204-lts ^
-  --image-project=ubuntu-os-cloud ^
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+### Verify GPU access
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
+---
+
+## Google Cloud Compute Engine Deployment
+
+### 1. Create the VM with GPU
+
+**Important:** Trellis 2 requires a GPU with at least 24GB VRAM. The NVIDIA L4 (24GB) is the most cost-effective option.
+
+**Option A: Use the automated script (Windows)**
+
+```cmd
+create-gpu-vm.bat
+```
+
+This script tries multiple zones to find available GPU capacity.
+
+**Option B: Manual creation**
+
+```bash
+# Try different zones if one is exhausted
+gcloud compute instances create text-to-3d-demo \
+  --project=YOUR_PROJECT_ID \
+  --zone=us-central1-c \
+  --machine-type=g2-standard-8 \
+  --accelerator=type=nvidia-l4,count=1 \
+  --boot-disk-size=200GB \
+  --image-family=ubuntu-2204-lts \
+  --image-project=ubuntu-os-cloud \
   --maintenance-policy=TERMINATE
 ```
 
-**2. Open firewall for port 8080:**
-```bash
-gcloud compute firewall-rules create allow-8080 ^
-  --project=text-to-3d-printer ^
-  --allow=tcp:8080 ^
-  --target-tags=http-server ^
-  --description="Allow port 8080"
+Alternative GPU options:
+- `nvidia-l4` (24GB) - Best price/performance, g2-standard-8
+- `nvidia-tesla-a100` (40GB) - More powerful, a2-highgpu-1g
 
-gcloud compute instances add-tags text-to-3d-demo ^
-  --project=text-to-3d-printer ^
-  --tags=http-server ^
-  --zone=us-west1-a
+### 2. Open firewall for port 8080
+
+```bash
+gcloud compute firewall-rules create allow-8080 \
+  --project=YOUR_PROJECT_ID \
+  --allow=tcp:8080 \
+  --target-tags=http-server \
+  --description="Allow port 8080 for text-to-3d-printer"
+
+gcloud compute instances add-tags text-to-3d-demo \
+  --project=YOUR_PROJECT_ID \
+  --tags=http-server \
+  --zone=us-central1-c
 ```
 
-**3. SSH into the VM:**
+### 3. SSH into the VM
+
 ```bash
-gcloud compute ssh text-to-3d-demo --project=text-to-3d-printer --zone=us-west1-a
+gcloud compute ssh text-to-3d-demo --project=YOUR_PROJECT_ID --zone=us-central1-c
 ```
 
-**4. Install Docker and NVIDIA runtime:**
+### 4. Install Docker and NVIDIA runtime
+
 ```bash
 # Install Docker
 curl -fsSL https://get.docker.com | sh
@@ -102,74 +161,67 @@ sudo systemctl restart docker
 exit
 ```
 
-**5. Copy project files from your local machine:**
+### 5. Copy project files to VM
 
-Run this from your **local terminal** (not SSH):
+From your **local machine**:
 
 ```bash
-gcloud compute scp --recurse C:\Users\machine314\Desktop\text-to-3d-printer text-to-3d-demo: --project=text-to-3d-printer --zone=us-west1-a
+# Windows
+gcloud compute scp --recurse "C:\path\to\text-to-3d-printer" text-to-3d-demo:~ --project=YOUR_PROJECT_ID --zone=us-central1-c
+
+# Linux/Mac
+gcloud compute scp --recurse ./text-to-3d-printer text-to-3d-demo:~ --project=YOUR_PROJECT_ID --zone=us-central1-c
 ```
 
-Replace `C:\Users\machine314\Desktop\text-to-3d-printer` with the actual path to your project folder.
+### 6. Build and run on VM
 
-**6. SSH back in:**
 ```bash
-gcloud compute ssh text-to-3d-demo --project=text-to-3d-printer --zone=us-west1-a
+gcloud compute ssh text-to-3d-demo --project=YOUR_PROJECT_ID --zone=us-central1-c
 cd text-to-3d-printer
-```
 
-**7. Create `.env` file:**
-```bash
+# Create .env file
 cat > .env << 'EOF'
-HF_TOKEN=hf_your_token_here
 REPLICATE_API_TOKEN=r8_your_token_here
+HF_TOKEN=hf_your_token_here
 EOF
-```
 
-**8. Build the image (~55 min):**
-```bash
-docker build -t text-to-3d-printer .
-```
+# Build (~45-60 min first time)
+./build.sh
 
-**9. Run:**
-```bash
+# Run
 docker run --gpus all -p 8080:8080 --env-file .env text-to-3d-printer
 ```
 
-**10. Access the app:**
+### 7. Access the app
 
 Get the external IP:
 ```bash
-gcloud compute instances describe text-to-3d-demo ^
-  --project=text-to-3d-printer ^
-  --zone=us-west1-a ^
+gcloud compute instances describe text-to-3d-demo \
+  --project=YOUR_PROJECT_ID \
+  --zone=us-central1-c \
   --format='get(networkInterfaces[0].accessConfigs[0].natIP)'
 ```
 
 Open `http://EXTERNAL_IP:8080` in your browser.
 
-**11. Stop the VM when not in use (to save costs):**
+### 8. Stop VM when not in use
+
 ```bash
-gcloud compute instances stop text-to-3d-demo ^
-  --project=text-to-3d-printer ^
-  --zone=us-west1-a
+gcloud compute instances stop text-to-3d-demo \
+  --project=YOUR_PROJECT_ID \
+  --zone=us-central1-c
 ```
 
 ---
 
-## Pushing app.py Revisions to GCE
+## Pushing app.py Updates (Hot Reload)
 
-When you make changes to `app.py`, you don't need to rebuild the Docker image (which takes ~55 min). Instead, use a volume mount to override the file inside the container.
+After the initial build, you can update `app.py` without rebuilding the entire image:
 
-### One-Time Setup
-
-SSH into the VM and create a helper script:
+### One-time setup on VM
 
 ```bash
-gcloud compute ssh text-to-3d-demo --project=text-to-3d-printer --zone=us-west1-a
-```
-
-```bash
+gcloud compute ssh text-to-3d-demo --project=YOUR_PROJECT_ID --zone=us-central1-c
 cd ~/text-to-3d-printer
 
 cat > run.sh << 'EOF'
@@ -184,62 +236,81 @@ docker run --gpus all -p 8080:8080 --env-file .env \
 EOF
 
 chmod +x run.sh
-```
-
-Then exit:
-```bash
 exit
 ```
 
-### Update Workflow
+### Update workflow
 
-From your **local terminal**, run these commands whenever you change `app.py`:
-
-**1. Copy the updated file to the VM:**
-```bash
-gcloud compute scp C:\Users\machine314\Desktop\text-to-3d-printer\app.py text-to-3d-demo:app.py --project=text-to-3d-printer --zone=us-west1-a
-```
-
-> **Note:** Windows doesn't expand `~`, so we copy to the home directory without a path, then move it after SSH.
-
-**2. SSH in, move the file, and restart:**
-```bash
-gcloud compute ssh text-to-3d-demo --project=text-to-3d-printer --zone=us-west1-a
-```
+From your **local machine**:
 
 ```bash
-mv ~/app.py ~/text-to-3d-printer/app.py
+# 1. Copy updated app.py
+gcloud compute scp app.py text-to-3d-demo:~/text-to-3d-printer/app.py --project=YOUR_PROJECT_ID --zone=us-central1-c
+
+# 2. SSH and restart
+gcloud compute ssh text-to-3d-demo --project=YOUR_PROJECT_ID --zone=us-central1-c
 cd ~/text-to-3d-printer
 ./run.sh
 ```
 
-The app will restart with your changes in seconds (no rebuild needed).
-
-### How It Works
-
-The `-v $(pwd)/app.py:/app/app.py:ro` flag mounts your local `app.py` over the one baked into the Docker image:
-- The container still uses all dependencies and model checkpoints from the image
-- Only `app.py` is read from the VM's filesystem
-- `:ro` means read-only (the container can't modify your file)
+The app restarts in seconds with your changes.
 
 ---
 
 ## Project Structure
 
 ```
-├── app.py                          # Main Gradio application
-├── Dockerfile                      # Docker build instructions
-├── .env                            # API tokens (create this yourself)
-├── download_checkpoints.py         # Helper to download model weights
-├── README.md                       # This file
-├── run.sh                          # Helper script for quick restarts (created on VM)
-└── patches/
-    └── utils3d_depth_patch.py      # Patch for MoGe v2 compatibility
+├── app.py                  # Main Gradio application
+├── Dockerfile              # Docker build (CUDA 12.4, PyTorch 2.6, Trellis 2)
+├── build.sh                # Build script
+├── create-gpu-vm.bat       # GCE VM creation script (Windows)
+├── .env                    # API tokens (create this yourself)
+├── README.md               # This file
+└── patches/                # Legacy patches (not used with Trellis 2)
 ```
 
-## Notes
+---
 
-- First image generation takes longer (downloads rembg model)
-- First 3D reconstruction takes longer (loads SAM 3D models)
-- The Docker image is ~55GB due to CUDA, PyTorch, and model checkpoints
-- Build time is ~30-45 minutes
+## Technical Notes
+
+### GPU Memory Requirements
+
+- **Minimum:** 24GB VRAM (RTX 3090, L4)
+- **Recommended:** 40GB+ VRAM (A100) for higher resolution generation
+
+### Trellis 2 Output Quality
+
+Trellis 2 generates meshes at different resolutions:
+- **512³** - ~3 seconds, good for previews
+- **1024³** - ~17 seconds, balanced quality
+- **1536³** - ~60 seconds, highest quality
+
+The default configuration uses moderate settings optimized for ~30-60 second generation time.
+
+### 3D Printing Tips
+
+1. **Full-color printing services** (Shapeways, Sculpteo): Upload the GLB file directly
+2. **Multi-material FDM** (Bambu AMS, Prusa MMU): Use the 3MF file in your slicer
+3. **Standard FDM**: Print STL in white, hand-paint using GLB preview as reference
+4. **Scaling**: Models may be small - scale up 10-100x in your slicer
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| "CUDA out of memory" | Reduce resolution or use a GPU with more VRAM |
+| "No GPU detected" | Check NVIDIA drivers and Container Toolkit installation |
+| Build fails at flash-attn | Safe to ignore - fallback attention will be used |
+| Model download slow | Add HF_TOKEN to .env for faster downloads |
+| GCE "quota exceeded" | Request GPU quota increase in Cloud Console |
+
+---
+
+## License
+
+This project uses:
+- [Microsoft TRELLIS.2](https://github.com/microsoft/TRELLIS.2) - MIT License
+- [Nano Banana](https://replicate.com/google/nano-banana) via Replicate
+- [rembg](https://github.com/danielgatis/rembg) for background removal

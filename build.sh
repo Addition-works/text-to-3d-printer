@@ -1,8 +1,8 @@
 #!/bin/bash
-# build.sh - Secure Docker build script for text-to-3d-printer
+# build.sh - Docker build script for text-to-3d-printer (Trellis 2 version)
 #
-# This script builds the Docker image using BuildKit secrets to avoid
-# baking API keys into image layers.
+# This script builds the Docker image for the Trellis 2-powered 3D model generator.
+# The HF_TOKEN is used during build to download model weights from HuggingFace.
 #
 # Usage:
 #   ./build.sh                    # Uses HF_TOKEN from environment or .env file
@@ -17,7 +17,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 echo "=========================================="
-echo " text-to-3d-printer - Secure Docker Build"
+echo " text-to-3d-printer - Trellis 2 Build"
 echo "=========================================="
 echo ""
 
@@ -30,11 +30,14 @@ if [ -z "$HF_TOKEN" ]; then
     fi
 fi
 
-# Validate we have a token
+# Validate we have a token (optional for Trellis 2 public model, but recommended)
 if [ -z "$HF_TOKEN" ]; then
-    echo -e "${RED}ERROR: HF_TOKEN not found!${NC}"
+    echo -e "${YELLOW}WARNING: HF_TOKEN not found!${NC}"
     echo ""
-    echo "Please either:"
+    echo "The Trellis 2 model (microsoft/TRELLIS.2-4B) is public, but"
+    echo "having an HF_TOKEN may help avoid rate limits during download."
+    echo ""
+    echo "To set a token, either:"
     echo "  1. Set HF_TOKEN environment variable:"
     echo "     export HF_TOKEN=hf_your_token_here"
     echo "     ./build.sh"
@@ -42,24 +45,30 @@ if [ -z "$HF_TOKEN" ]; then
     echo "  2. Or create a .env file with:"
     echo "     HF_TOKEN=hf_your_token_here"
     echo ""
-    exit 1
+    echo "Continuing without token..."
+    echo ""
+else
+    # Show token prefix for verification (don't show full token!)
+    TOKEN_PREFIX="${HF_TOKEN:0:10}"
+    echo -e "${GREEN}Found HF_TOKEN (starts with: ${TOKEN_PREFIX}...)${NC}"
+    echo ""
 fi
 
-# Show token prefix for verification (don't show full token!)
-TOKEN_PREFIX="${HF_TOKEN:0:10}"
-echo -e "${GREEN}✓ Found HF_TOKEN (starts with: ${TOKEN_PREFIX}...)${NC}"
-echo ""
-
-# Ensure BuildKit is enabled
+# Ensure BuildKit is enabled for better caching
 export DOCKER_BUILDKIT=1
 
-echo "Building Docker image with BuildKit secrets..."
-echo "(Your HF_TOKEN is passed securely and NOT stored in image layers)"
+echo "Building Docker image..."
+echo "This will:"
+echo "  - Install CUDA 12.4, PyTorch 2.6.0, and Trellis 2 dependencies"
+echo "  - Clone and install microsoft/TRELLIS.2"
+echo "  - Download the TRELLIS.2-4B model weights (~10GB)"
+echo ""
+echo "Estimated build time: 45-60 minutes (first build)"
+echo "Estimated image size: ~50-60 GB"
 echo ""
 
-# Build with secret - the token is mounted at /run/secrets/hf_token during build only
+# Build the image
 docker build \
-    --secret id=hf_token,env=HF_TOKEN \
     -t text-to-3d-printer \
     .
 
@@ -68,8 +77,14 @@ echo -e "${GREEN}=========================================="
 echo " Build complete!"
 echo "==========================================${NC}"
 echo ""
-echo "To run the container:"
+echo "To run the container locally:"
 echo "  docker run --gpus all -p 8080:8080 --env-file .env text-to-3d-printer"
 echo ""
-echo "Note: The .env file is needed at RUNTIME for REPLICATE_API_TOKEN,"
-echo "      but it is NOT baked into the image."
+echo "Required environment variables in .env:"
+echo "  REPLICATE_API_TOKEN=r8_your_token_here  (for image generation)"
+echo ""
+echo "Optional environment variables:"
+echo "  HF_TOKEN=hf_your_token_here  (for HuggingFace access)"
+echo ""
+echo "Open http://localhost:8080 in your browser."
+echo ""
